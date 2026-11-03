@@ -8,6 +8,7 @@ import hashlib
 import shlex
 import subprocess
 import time
+import threading
 import psutil
 import docker
 from datetime import datetime, timedelta
@@ -104,6 +105,12 @@ AUTOHEAL_CONFIG_FILE = os.path.join(DATA_DIR, "autoheal_config.json")
 SCHEDULES_FILE = os.path.join(DATA_DIR, "schedules.json")
 AUDIT_LOG_FILE = os.path.join(DATA_DIR, "audit.log")
 PLUGIN_CONFIG_FILE = os.path.join(DATA_DIR, "plugins.json")
+DOCKER_MONITOR_STATE_FILE = os.path.join(DATA_DIR, "docker_monitor_state.json")
+docker_manual_stops = set()
+docker_unexpected_exits = {}
+docker_event_since = 0
+docker_event_lock = threading.RLock()
+docker_event_thread = None
 
 DEFAULT_BACKUP_CONFIG = {
     "paths": ["/home/adelf/projects"],
@@ -3063,6 +3070,149 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # МОНИТОРИНГ
 # ═══════════════════════════════════════════════════════════════
 
+
+def save_docker_event_state():
+    with docker_event_lock:
+        state = {
+            "manual_stops": sorted(docker_manual_stops),
+            "unexpected_exits": docker_unexpected_exits.copy(),
+            "since": docker_event_since,
+        }
+    save_json_file(DOCKER_MONITOR_STATE_FILE, state)
+
+
+def process_docker_event(event):
+    """Учитывает намеренные остановки и самостоятельные завершения контейнеров."""
+    global docker_event_since
+
+    action = str(event.get("Action") or event.get("status") or "").lower()
+    actor = event.get("Actor") or event.get("actor") or {}
+    attrs = actor.get("Attributes") or {}
+
+    container_id = actor.get("ID") or event.get("id") or event.get("ID")
+    if not container_id:
+        return
+
+    name = str(attrs.get("name") or container_id[:12]).lstrip("/")
+    event_time = event.get("time") or int(time.time())
+    event_id = str(
+        event.get("timeNano")
+        or f"{event_time}:{action}:{container_id}"
+    )
+
+    with docker_event_lock:
+        try:
+            docker_event_since = max(
+                docker_event_since, int(event_time)
+            )
+        except (TypeError, ValueError):
+            pass
+
+        if action in ("kill", "stop"):
+            # docker stop / docker kill: намеренное действие оператора.
+            docker_manual_stops.add(container_id)
+            docker_unexpected_exits.pop(container_id, None)
+
+        elif action == "die":
+            # die без предшествующего kill означает самостоятельное завершение.
+            if container_id not in docker_manual_stops:
+                previous = docker_unexpected_exits.get(container_id)
+                if not previous or previous.get("event_id") != event_id:
+                    docker_unexpected_exits[container_id] = {
+                        "name": name,
+                        "exit_code": attrs.get("exitCode", "unknown"),
+                        "oom_killed": str(attrs.get("oomKilled", "")).lower() == "true",
+                        "event_id": event_id,
+                        "time": int(event_time),
+                        "notified": False,
+                    }
+
+        elif action in ("start", "restart", "unpause"):
+            # После повторного запуска будущие аварии снова отслеживаются.
+            docker_manual_stops.discard(container_id)
+
+        elif action in ("destroy", "remove"):
+            docker_manual_stops.discard(container_id)
+            docker_unexpected_exits.pop(container_id, None)
+
+    save_docker_event_state()
+
+
+def docker_event_watch_loop():
+    """Фоновое чтение событий Docker с автоматическим переподключением."""
+    while True:
+        try:
+            with docker_event_lock:
+                since = max(0, docker_event_since - 1)
+
+            events = docker_client.events(
+                decode=True,
+                since=since,
+                filters={"type": "container"},
+            )
+
+            for event in events:
+                process_docker_event(event)
+
+        except Exception as exc:
+            print(f"Docker event monitor reconnect: {exc}", flush=True)
+            time.sleep(3)
+
+
+def start_docker_event_monitor():
+    """Поднимает наблюдатель и запоминает уже остановленные контейнеры."""
+    global docker_event_thread, docker_event_since
+
+    if not docker_client:
+        print("Docker event monitor unavailable: Docker client is missing.")
+        return
+
+    if docker_event_thread and docker_event_thread.is_alive():
+        return
+
+    saved = load_json_file(DOCKER_MONITOR_STATE_FILE, {})
+    if not isinstance(saved, dict):
+        saved = {}
+
+    with docker_event_lock:
+        docker_manual_stops.update(
+            str(x) for x in saved.get("manual_stops", [])
+        )
+        stored_exits = saved.get("unexpected_exits", {})
+        if isinstance(stored_exits, dict):
+            docker_unexpected_exits.update(stored_exits)
+        try:
+            docker_event_since = int(saved.get("since", 0))
+        except (TypeError, ValueError):
+            docker_event_since = 0
+
+        # При первой установке начинаем слушать события с текущего момента.
+        if not docker_event_since:
+            docker_event_since = max(0, int(time.time()) - 2)
+
+    # Сначала запускаем поток событий, затем снимаем исходный снимок.
+    docker_event_thread = threading.Thread(
+        target=docker_event_watch_loop,
+        name="mybot-docker-events",
+        daemon=True,
+    )
+    docker_event_thread.start()
+
+    try:
+        containers = docker_client.containers.list(all=True)
+        with docker_event_lock:
+            for container in containers:
+                # Старые остановленные контейнеры не считаются новыми авариями.
+                if (
+                    container.status != "running"
+                    and container.id not in docker_unexpected_exits
+                ):
+                    docker_manual_stops.add(container.id)
+        save_docker_event_state()
+    except Exception as exc:
+        print(f"Docker initial state error: {exc}", flush=True)
+
+
 async def monitor(context: ContextTypes.DEFAULT_TYPE):
     global alert_cooldown
     if not ADMIN_ID and not AUTHENTICATED_USERS:
@@ -3093,12 +3243,30 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE):
         alerts.append(f"🔥 Диск: `{disk_pct:.1f}%`")
 
     if docker_client:
-        try:
-            for c in docker_client.containers.list(all=True):
-                if c.status == "exited" and should_alert(f"c_{c.name}", 60):
-                    alerts.append(f"💀 Упал: `{c.name}`")
-        except Exception:
-            pass
+        pending_docker_alerts = []
+        state_changed = False
+
+        with docker_event_lock:
+            for container_id, item in docker_unexpected_exits.items():
+                if item.get("notified"):
+                    continue
+
+                name = str(item.get("name") or container_id[:12])
+                exit_code = item.get("exit_code", "unknown")
+                details = f" (exit={exit_code})"
+                if item.get("oom_killed"):
+                    details += " OOM"
+
+                pending_docker_alerts.append(
+                    f"💀 Самостоятельно завершился: `{name}`{details}"
+                )
+                item["notified"] = True
+                state_changed = True
+
+        if state_changed:
+            save_docker_event_state()
+
+        alerts.extend(pending_docker_alerts)
 
     # Автопочинка сервисов (по конфигу).
     try:
@@ -3162,6 +3330,7 @@ async def post_init(application):
         ("terminal", "Режим терминала"),
         ("help", "Помощь"),
     ])
+    start_docker_event_monitor()
 
 # ═══════════════════════════════════════════════════════════════
 # ЗАПУСК
