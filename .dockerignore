@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+.mybot-runtime.env
+botkey
+*.pem
+*.key
+id_*
+*.bak
+*.pre-*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.log
