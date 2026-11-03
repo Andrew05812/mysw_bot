@@ -1547,6 +1547,7 @@ def main_kb():
         [KeyboardButton("⏰ Планировщик"), KeyboardButton("🧩 Плагины")],
         [KeyboardButton("📁 Файлы"), KeyboardButton("🩻 Диагностика")],
         [KeyboardButton("🧾 Аудит")],
+        [KeyboardButton("🚀 Обновить бота")],
         [KeyboardButton("🔄 Перезагрузить"), KeyboardButton("😴 Suspend")],
         [KeyboardButton("🔐 Выйти из аккаунта")],
         [KeyboardButton("📖 Помощь")]
@@ -1714,6 +1715,25 @@ async def logout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     append_audit(uid, "logout", "ok")
     await update.message.reply_text("🔒 Вы вышли из аккаунта. Для входа снова нажмите /start.")
+
+async def deploy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not user_is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Доступ запрещен.")
+        return
+
+    await update.message.reply_text(
+        "🚀 *Обновление mybot из GitHub*\n\n"
+        "Будет проверена ветка `main`. Если появился новый коммит, "
+        "система соберёт образ, проверит его и переключит контейнер.\n\n"
+        "При ошибке будет выполнен автоматический откат. "
+        "Во время переключения бот может быть недоступен несколько секунд.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬆️ Проверить и обновить", callback_data="deploy_prompt")],
+            [InlineKeyboardButton("📊 Статус обновления", callback_data="deploy_status")],
+        ]),
+    )
+
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_is_admin(update.effective_user.id):
@@ -2207,6 +2227,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🩻 Диагностика": diagnostics_handler,
         "🧾 Аудит": audit_handler,
         "🧩 Плагины": plugins_handler,
+        "🚀 Обновить бота": deploy_handler,
         "📁 Файлы": None,
         "🔐 Выйти из аккаунта": logout_handler,
         "😴 Suspend": suspend_handler,
@@ -2602,6 +2623,72 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(export_path, "rb") as f:
             await q.message.reply_document(document=f, filename=os.path.basename(export_path))
         await edit("✅ Экспорт отправлен.", [[InlineKeyboardButton("◀️ Назад", callback_data="audit_menu")]])
+    elif d == "deploy_prompt":
+        await edit(
+            "⚠️ *Подтверждение обновления*\n\n"
+            "Проверить GitHub и установить последнюю версию из `main`?\n"
+            "При ошибке будет восстановлена предыдущая версия.",
+            [
+                [InlineKeyboardButton("✅ Подтвердить обновление", callback_data="deploy_confirm")],
+                [InlineKeyboardButton("📊 Статус", callback_data="deploy_status")],
+                [InlineKeyboardButton("❌ Отмена", callback_data="deploy_cancel")],
+            ],
+        )
+
+    elif d == "deploy_confirm":
+        result = host_run(
+            "sudo -n systemctl start --no-block mybot-deploy.service",
+            timeout=10,
+        )
+        if result.startswith(("❌", "⏰")) or "Failed to start" in result:
+            append_audit(q.from_user.id, "deploy_start", "fail", result[:300])
+            await edit(
+                "❌ Не удалось запустить обновление.\n"
+                f"```{sanitize_codeblock(result)[:1200]}```"
+            )
+            return
+
+        append_audit(q.from_user.id, "deploy_start", "ok", "systemd job requested")
+        await edit(
+            "⏳ *Обновление запущено.*\n\n"
+            "Сборка и переключение выполняются на сервере. "
+            "Результат можно проверить кнопкой ниже.",
+            [[InlineKeyboardButton("📊 Проверить статус", callback_data="deploy_status")]],
+        )
+
+    elif d == "deploy_status":
+        command = (
+            "echo 'SERVICE'; "
+            "systemctl show mybot-deploy.service "
+            "-p ActiveState -p SubState -p Result; "
+            "echo 'CONTAINER'; "
+            "docker inspect mybot --format "
+            "'Status={{.State.Status}} Image={{.Config.Image}} Restarts={{.RestartCount}}' "
+            "2>&1; "
+            "echo 'DEPLOYED_COMMIT'; "
+            "cat /home/adelf/.local/share/mybot/deployed-commit 2>/dev/null "
+            "|| echo unknown; "
+            "echo 'RECENT_LOG'; "
+            "journalctl -u mybot-deploy.service -n 18 --no-pager -o cat"
+        )
+        result = host_run(command, timeout=15)
+        result = truncate_long_output(
+            sanitize_codeblock(result),
+            max_total=2800,
+            head_chars=1200,
+            tail_chars=1500,
+        )
+        await edit(
+            f"📊 *Статус обновления*\n\n```{result}```",
+            [
+                [InlineKeyboardButton("🔄 Обновить статус", callback_data="deploy_status")],
+                [InlineKeyboardButton("❌ Закрыть", callback_data="deploy_cancel")],
+            ],
+        )
+
+    elif d == "deploy_cancel":
+        await edit("❌ Действие отменено.")
+
     elif d == "plugins_menu":
         await edit(plugin_menu_text(), plugin_menu_keyboard())
     elif d.startswith("plugin_run_"):
@@ -3070,6 +3157,7 @@ async def post_init(application):
         ("diag", "Самодиагностика"),
         ("audit", "Аудит лог"),
         ("plugins", "Плагины"),
+        ("deploy", "Обновить бота"),
         ("logout", "Выйти из аккаунта"),
         ("terminal", "Режим терминала"),
         ("help", "Помощь"),
@@ -3147,6 +3235,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("diag", diagnostics_handler))
     app.add_handler(CommandHandler("audit", audit_handler))
     app.add_handler(CommandHandler("plugins", plugins_handler))
+    app.add_handler(CommandHandler("deploy", deploy_handler))
     app.add_handler(CommandHandler("logout", logout_handler))
     app.add_handler(CommandHandler("terminal", terminal_handler))
     app.add_handler(CommandHandler("help", help_handler))
