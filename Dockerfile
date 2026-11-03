@@ -10,6 +10,5 @@ RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 
-ENV SSH_KEY_PATH=/run/secrets/mybot_ssh_key
 
 CMD ["python3", "bot.py"]
