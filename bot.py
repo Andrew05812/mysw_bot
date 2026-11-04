@@ -1,4 +1,5 @@
 import os
+import asyncio
 
 SSH_KEY_PATH = os.environ.get(
     "SSH_KEY_PATH", "/run/secrets/mybot_ssh_key"
@@ -9,6 +10,11 @@ import shlex
 import subprocess
 import time
 import threading
+
+# Locks for background jobs running through asyncio.to_thread.
+_BACKUP_LOCK = threading.Lock()
+_AUTOHEAL_LOCK = threading.Lock()
+_SCHEDULER_LOCK = threading.RLock()
 import psutil
 import docker
 from datetime import datetime, timedelta
@@ -972,7 +978,7 @@ def get_updates_check_text() -> str:
     out = truncate_long_output(out, max_total=3500, head_chars=1500, tail_chars=1700)
     return out
 
-def run_backup_now(paths: list[str] | None = None, label: str = "manual", retention_days: int | None = None) -> dict:
+def _run_backup_now_unlocked(paths: list[str] | None = None, label: str = "manual", retention_days: int | None = None) -> dict:
     paths = paths or backup_config.get("paths") or ["/home/adelf/projects"]
     retention_days = int(retention_days if retention_days is not None else backup_config.get("retention_days", 14))
     backup_root = str(backup_config.get("backup_root") or "/home/adelf/backups")
@@ -1005,6 +1011,11 @@ def run_backup_now(paths: list[str] | None = None, label: str = "manual", retent
     backup_config["last_status"] = "ok"
     save_json_file(BACKUP_CONFIG_FILE, backup_config)
     return {"ok": True, "archive": archive_path, "checksum": checksum_path, "meta": meta_path, "output": out}
+
+def run_backup_now(paths: list[str] | None = None, label: str = "manual", retention_days: int | None = None) -> dict:
+    with _BACKUP_LOCK:
+        return _run_backup_now_unlocked(paths=paths, label=label, retention_days=retention_days)
+
 
 def verify_backup_archive(archive_path: str) -> dict:
     if not archive_path:
@@ -1136,7 +1147,7 @@ def scheduler_task_detail_kb(task_id: str) -> list:
         [InlineKeyboardButton("◀️ Назад", callback_data="sched_menu")],
     ]
 
-def execute_scheduler_task(task: dict) -> tuple[bool, str]:
+def _execute_scheduler_task_unlocked(task: dict) -> tuple[bool, str]:
     kind = task.get("kind")
     if kind == "shell":
         cmd = str(task.get("command") or "").strip()
@@ -1170,7 +1181,12 @@ def execute_scheduler_task(task: dict) -> tuple[bool, str]:
         return True, "apt full-upgrade done"
     return False, "unknown task kind"
 
-def autoheal_tick() -> list[str]:
+def execute_scheduler_task(task: dict) -> tuple[bool, str]:
+    with _SCHEDULER_LOCK:
+        return _execute_scheduler_task_unlocked(task)
+
+
+def _autoheal_tick_unlocked() -> list[str]:
     if not autoheal_config.get("enabled", True):
         return []
     alerts = []
@@ -1197,7 +1213,12 @@ def autoheal_tick() -> list[str]:
             alerts.append(f"🩺 autoheal: `{svc}` перезапущен (был `{st}`)")
     return alerts
 
-def scheduler_tick() -> list[str]:
+def autoheal_tick() -> list[str]:
+    with _AUTOHEAL_LOCK:
+        return _autoheal_tick_unlocked()
+
+
+def _scheduler_tick_unlocked() -> list[str]:
     now = now_ts()
     events = []
     changed = False
@@ -1223,6 +1244,11 @@ def scheduler_tick() -> list[str]:
         save_json_file(SCHEDULES_FILE, schedules)
     return events
 
+def scheduler_tick() -> list[str]:
+    with _SCHEDULER_LOCK:
+        return _scheduler_tick_unlocked()
+
+
 async def systemd_logs_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Доступ запрещен.")
@@ -1237,7 +1263,7 @@ async def ufw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Доступ запрещен.")
         return
     msg = await update.message.reply_text("⏳ Проверяю UFW...")
-    text = get_ufw_status_text()
+    text = await asyncio.to_thread(get_ufw_status_text)
     await msg.edit_text(
         f"🧯 *UFW статус*\n\n```\n{text}\n```",
         parse_mode="Markdown",
@@ -1249,7 +1275,7 @@ async def updates_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Доступ запрещен.")
         return
     msg = await update.message.reply_text("⏳ Проверяю обновления...")
-    text = get_updates_check_text()
+    text = await asyncio.to_thread(get_updates_check_text)
     await msg.edit_text(
         "🧰 *Обновления (проверка)*\n\n"
         f"```\n{text}\n```",
@@ -1297,7 +1323,7 @@ async def diagnostics_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⛔ Доступ запрещен.")
         return
     await update.message.reply_text(
-        diagnostics_text(),
+        await asyncio.to_thread(diagnostics_text),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить", callback_data="diag_menu")]]),
     )
@@ -1306,7 +1332,7 @@ async def audit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Доступ запрещен.")
         return
-    rows = read_audit_tail(40)
+    rows = await asyncio.to_thread(read_audit_tail, 40)
     if not rows:
         txt = "🧾 *Аудит*\n\nЛог пуст."
     else:
@@ -1518,7 +1544,7 @@ async def files_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("fs_rename_pending", None)
     context.user_data.pop("fs_mkdir_pending", None)
     context.user_data.pop("fs_touch_pending", None)
-    data = host_ls_dir("/", FS_PAGE_LIMIT)
+    data = await asyncio.to_thread(host_ls_dir, "/", FS_PAGE_LIMIT)
     if not data.get("ok"):
         await update.message.reply_text(f"❌ Ошибка чтения `/`: {data.get('error') or data}")
         return
@@ -1538,7 +1564,7 @@ async def files_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def suspend_handler(update, context):
     try:
         await update.message.reply_text("😴 Сервер уходит в suspend...")
-        host_run("sudo ethtool -s eno1 wol g && sudo systemctl suspend")
+        await asyncio.to_thread(host_run, "sudo ethtool -s eno1 wol g && sudo systemctl suspend")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -1612,7 +1638,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = await update.message.reply_text("⏳ Собираю данные...")
     try:
-        stats = get_system_stats()
+        stats = await asyncio.to_thread(get_system_stats)
         await msg.edit_text(stats, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Обновить", callback_data="status"),
             InlineKeyboardButton("📋 Процессы", callback_data="processes")
@@ -1624,7 +1650,7 @@ async def sysinfo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Доступ запрещен.")
         return
-    info = host_collect_sysinfo()
+    info = await asyncio.to_thread(host_collect_sysinfo)
     if not info.get("ok"):
         await update.message.reply_text(f"❌ Ошибка sysinfo: `{info.get('error') or info}`")
         return
@@ -1638,7 +1664,7 @@ async def sysinfo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cpu_phys = info.get("cpu_phys") or 0
     cpu_log = info.get("cpu_log") or 0
     ram_gb = info.get("ram_gb") or 0
-    storage = host_collect_system_metrics(interval_seconds=0.2)
+    storage = await asyncio.to_thread(host_collect_system_metrics, interval_seconds=0.2)
     all_total = int(storage.get("all_disks_total_gb", 0)) if storage.get("ok") else 0
     all_used = int(storage.get("all_disks_used_gb", 0)) if storage.get("ok") else 0
     all_avail = int(storage.get("all_disks_avail_gb", 0)) if storage.get("ok") else 0
@@ -1672,7 +1698,7 @@ async def docker_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Доступ запрещен.")
         return
-    text, keyboard = get_containers_text()
+    text, keyboard = await asyncio.to_thread(get_containers_text)
     if isinstance(keyboard, list) and keyboard:
         await update.message.reply_text(text, parse_mode="Markdown",
                                          reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1683,7 +1709,7 @@ async def processes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Доступ запрещен.")
         return
-    text = get_processes()
+    text = await asyncio.to_thread(get_processes)
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Обновить", callback_data="processes")
     ]]))
@@ -1692,7 +1718,7 @@ async def network_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Доступ запрещен.")
         return
-    text = get_network_info()
+    text = await asyncio.to_thread(get_network_info)
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Обновить", callback_data="network")
     ]]))
@@ -1702,7 +1728,7 @@ async def services_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Доступ запрещен.")
         return
     msg = await update.message.reply_text("⏳ Проверяю сервисы...")
-    text, keyboard = get_services()
+    text, keyboard = await asyncio.to_thread(get_services)
     await msg.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def terminal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1843,25 +1869,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "reboot_yes":
             await update.message.reply_text("🔄 *Перезагружаю...* Бот вернётся через ~30 сек.", parse_mode="Markdown")
             try:
-                host_run("sudo -n reboot", timeout=20)
+                await asyncio.to_thread(host_run, "sudo -n reboot", timeout=20)
             except Exception:
                 pass
             return
         if action == "updates_upgrade_yes":
             msg = await update.message.reply_text("🔄 Запускаю обновления... (это может занять несколько минут)")
-            result = host_run(
-                "DEBIAN_FRONTEND=noninteractive sudo -n apt-get update && "
+            result = await asyncio.to_thread(host_run, "DEBIAN_FRONTEND=noninteractive sudo -n apt-get update && "
                 "DEBIAN_FRONTEND=noninteractive sudo -n apt-get -y full-upgrade "
                 "-o APT::Get::Assume-Yes=true "
                 "-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "
-                "-o Acquire::Retries=5 -o Acquire::http::Timeout=30",
-                timeout=1800,
-            )
+                "-o Acquire::Retries=5 -o Acquire::http::Timeout=30", timeout=1800)
             result = sanitize_codeblock(result).strip() or "(нет вывода)"
-            remaining = host_run(
-                "apt list --upgradable 2>&1 | sed -e '/WARNING: apt does not have a stable CLI interface/d' | head -n 120",
-                timeout=60,
-            )
+            remaining = await asyncio.to_thread(host_run, "apt list --upgradable 2>&1 | sed -e '/WARNING: apt does not have a stable CLI interface/d' | head -n 120", timeout=60)
             remaining = sanitize_codeblock(remaining).strip() or "(нет вывода)"
             remaining_count = len([ln for ln in remaining.splitlines() if "upgradable from" in ln])
             result = truncate_long_output(result, max_total=3500, head_chars=1600, tail_chars=1700)
@@ -1882,9 +1902,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if tpath == "/" or fs_is_blocked_path(tpath):
                 await update.message.reply_text("⛔ Удаление запрещено.")
                 return
-            host_run(f"rm -rf -- {shlex.quote(tpath)}", timeout=120)
+            await asyncio.to_thread(host_run, f"rm -rf -- {shlex.quote(tpath)}", timeout=120)
             context.user_data["fs_delete_target"] = None
-            data = host_ls_dir(current_dir, FS_PAGE_LIMIT)
+            data = await asyncio.to_thread(host_ls_dir, current_dir, FS_PAGE_LIMIT)
             if not data.get("ok"):
                 await update.message.reply_text(f"✅ Удалено, но не могу прочитать папку: {data.get('error') or data}")
                 return
@@ -1907,7 +1927,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if fs_is_blocked_path(dir_path):
             await update.message.reply_text("⛔ Этот каталог заблокирован для безопасности.")
             return
-        data = host_ls_dir(dir_path, FS_PAGE_LIMIT)
+        data = await asyncio.to_thread(host_ls_dir, dir_path, FS_PAGE_LIMIT)
         if not data.get("ok"):
             await update.message.reply_text(f"❌ Ошибка чтения папки: `{data.get('error') or data}`", parse_mode="Markdown")
             return
@@ -1969,7 +1989,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⛔ Некорректный/заблокированный новый путь.")
             return
 
-        rc = host_run(f"mv -n -- {shlex.quote(src)} {shlex.quote(dst)}", timeout=300)
+        rc = await asyncio.to_thread(host_run, f"mv -n -- {shlex.quote(src)} {shlex.quote(dst)}", timeout=300)
         if rc and (rc.startswith("❌") or rc.startswith("⏰")):
             await update.message.reply_text(f"❌ Не смог переименовать/переместить:\n`{truncate_long_output(sanitize_codeblock(rc), max_total=1500)}`", parse_mode="Markdown")
             return
@@ -1997,7 +2017,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new_dir == "/" or fs_is_blocked_path(new_dir):
             await update.message.reply_text("⛔ Некорректный/заблокированный путь.")
             return
-        rc = host_run(f"mkdir -p -- {shlex.quote(new_dir)}", timeout=120)
+        rc = await asyncio.to_thread(host_run, f"mkdir -p -- {shlex.quote(new_dir)}", timeout=120)
         if rc and (rc.startswith("❌") or rc.startswith("⏰")):
             await update.message.reply_text(f"❌ Не смог создать папку:\n`{truncate_long_output(sanitize_codeblock(rc), max_total=1500)}`", parse_mode="Markdown")
             return
@@ -2021,7 +2041,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new_file == "/" or fs_is_blocked_path(new_file):
             await update.message.reply_text("⛔ Некорректный/заблокированный путь.")
             return
-        rc = host_run(f"touch -- {shlex.quote(new_file)}", timeout=120)
+        rc = await asyncio.to_thread(host_run, f"touch -- {shlex.quote(new_file)}", timeout=120)
         if rc and (rc.startswith("❌") or rc.startswith("⏰")):
             await update.message.reply_text(f"❌ Не смог создать файл:\n`{truncate_long_output(sanitize_codeblock(rc), max_total=1500)}`", parse_mode="Markdown")
             return
@@ -2265,7 +2285,7 @@ async def run_shell(update: Update, context: ContextTypes.DEFAULT_TYPE, command:
     context.user_data["last_shell_cmd"] = command
     msg = await update.message.reply_text(f"⚙️ `{command}`...", parse_mode="Markdown")
     try:
-        emoji, output = run_shell_command(command, timeout=30)
+        emoji, output = await asyncio.to_thread(run_shell_command, command, timeout=30)
         append_audit(update.effective_user.id, "shell", "ok" if emoji == "✅" else "fail", command)
         await msg.edit_text(
             f"{emoji} `$ {command}`\n```\n{output}\n```",
@@ -2330,7 +2350,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data.pop("fs_goto_pending", None)
                 context.user_data.pop("fs_goto_prev_dir", None)
                 clipboard = context.user_data.get("fs_clipboard_path")
-                data = host_ls_dir(current_dir, FS_PAGE_LIMIT)
+                data = await asyncio.to_thread(host_ls_dir, current_dir, FS_PAGE_LIMIT)
                 if not data.get("ok"):
                     await edit(f"❌ Ошибка чтения папки: {data.get('error') or data}")
                     return
@@ -2355,7 +2375,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if fs_is_blocked_path(path):
                     await edit("⛔ Этот путь заблокирован для безопасности.")
                     return
-                data = host_ls_dir(path, FS_PAGE_LIMIT)
+                data = await asyncio.to_thread(host_ls_dir, path, FS_PAGE_LIMIT)
                 if not data.get("ok"):
                     await edit(f"❌ Не могу открыть {fs_format_path(path)}: {data.get('error') or data}")
                     return
@@ -2429,7 +2449,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 context.user_data["fs_return_dir"] = current_dir
                 context.user_data["fs_view_path"] = fpath
-                pv = host_preview_file(fpath, max_bytes=200000)
+                pv = await asyncio.to_thread(host_preview_file, fpath, max_bytes=200000)
                 if not pv.get("ok"):
                     await edit(f"❌ Ошибка чтения файла: {pv.get('error') or pv}")
                     return
@@ -2551,10 +2571,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if mode == "move":
                     # mv -n не перезапишет существующий файл/каталог.
-                    rc = host_run(
-                        f"mv -n -- {shlex.quote(src)} {shlex.quote(dst)}",
-                        timeout=300,
-                    )
+                    rc = await asyncio.to_thread(host_run, f"mv -n -- {shlex.quote(src)} {shlex.quote(dst)}", timeout=300)
                     if rc and (rc.startswith("❌") or rc.startswith("⏰")):
                         await edit(f"❌ Не смог переместить:\n\n```\n{truncate_long_output(sanitize_codeblock(rc), max_total=1500)}\n```")
                         return
@@ -2563,13 +2580,13 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     done_text = "✅ Перемещено."
                 else:
                     # cp -a копирует и метаданные; для директорий - рекурсивно.
-                    rc = host_run(f"cp -a -- {shlex.quote(src)} {shlex.quote(dst)}", timeout=300)
+                    rc = await asyncio.to_thread(host_run, f"cp -a -- {shlex.quote(src)} {shlex.quote(dst)}", timeout=300)
                     if rc and (rc.startswith("❌") or rc.startswith("⏰")):
                         await edit(f"❌ Не смог скопировать:\n\n```\n{truncate_long_output(sanitize_codeblock(rc), max_total=1500)}\n```")
                         return
                     done_text = "✅ Скопировано."
 
-                data = host_ls_dir(current_dir, FS_PAGE_LIMIT)
+                data = await asyncio.to_thread(host_ls_dir, current_dir, FS_PAGE_LIMIT)
                 if not data.get("ok"):
                     await edit(f"✅ Скопировано, но не могу прочитать папку: {data.get('error') or data}")
                     return
@@ -2591,7 +2608,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await edit("⛔ Этот путь заблокирован для безопасности.")
                 return
 
-            data = host_ls_dir(path, FS_PAGE_LIMIT)
+            data = await asyncio.to_thread(host_ls_dir, path, FS_PAGE_LIMIT)
             if not data.get("ok"):
                 await edit(f"❌ Ошибка чтения папки: {data.get('error') or data}")
                 return
@@ -2612,9 +2629,9 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "backup_menu":
         await edit(get_backup_menu_text(), get_backup_menu_keyboard())
     elif d == "diag_menu":
-        await edit(diagnostics_text(), [[InlineKeyboardButton("🔄 Обновить", callback_data="diag_menu")]])
+        await edit(await asyncio.to_thread(diagnostics_text), [[InlineKeyboardButton("🔄 Обновить", callback_data="diag_menu")]])
     elif d == "audit_menu":
-        rows = read_audit_tail(40)
+        rows = await asyncio.to_thread(read_audit_tail, 40)
         if not rows:
             txt = "🧾 *Аудит*\n\nЛог пуст."
         else:
@@ -2622,7 +2639,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt = "🧾 *Аудит (последние записи)*\n\n" + "\n".join(tail)
         await edit(txt, [[InlineKeyboardButton("📤 Экспорт", callback_data="audit_export"), InlineKeyboardButton("🔄 Обновить", callback_data="audit_menu")]])
     elif d == "audit_export":
-        txt = export_audit_text(max_lines=500)
+        txt = await asyncio.to_thread(export_audit_text, max_lines=500)
         ensure_data_dir()
         export_path = os.path.join(DATA_DIR, f"audit-export-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log")
         with open(export_path, "w", encoding="utf-8") as f:
@@ -2643,10 +2660,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif d == "deploy_confirm":
-        result = host_run(
-            "sudo -n systemctl start --no-block mybot-deploy.service",
-            timeout=10,
-        )
+        result = await asyncio.to_thread(host_run, "sudo -n systemctl start --no-block mybot-deploy.service", timeout=10)
         if result.startswith(("❌", "⏰")) or "Failed to start" in result:
             append_audit(q.from_user.id, "deploy_start", "fail", result[:300])
             await edit(
@@ -2678,7 +2692,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "echo 'RECENT_LOG'; "
             "journalctl -u mybot-deploy.service -n 18 --no-pager -o cat"
         )
-        result = host_run(command, timeout=15)
+        result = await asyncio.to_thread(host_run, command, timeout=15)
         result = truncate_long_output(
             sanitize_codeblock(result),
             max_total=2800,
@@ -2700,7 +2714,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit(plugin_menu_text(), plugin_menu_keyboard())
     elif d.startswith("plugin_run_"):
         pname = d[len("plugin_run_"):]
-        ok, out = run_plugin(pname)
+        ok, out = await asyncio.to_thread(run_plugin, pname)
         append_audit(q.from_user.id, f"plugin:{pname}", "ok" if ok else "fail", out[:300])
         await edit(
             f"🧩 *Плагин:* `{pname}`\n\n```\n{out}\n```",
@@ -2708,7 +2722,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif d == "backup_run_now":
         await edit("🗄 Делаю бэкап... это может занять время")
-        r = run_backup_now(paths=backup_config.get("paths"), label="manual")
+        r = await asyncio.to_thread(run_backup_now, paths=backup_config.get("paths"), label="manual")
         if r.get("ok"):
             append_audit(q.from_user.id, "backup_run_now", "ok", r.get("archive", ""))
             await edit(
@@ -2724,7 +2738,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit("✅ Пути бэкапа установлены: `/home/adelf/projects`", get_backup_menu_keyboard())
     elif d == "backup_verify_last":
         last = backup_config.get("last_file") or ""
-        vr = verify_backup_archive(last)
+        vr = await asyncio.to_thread(verify_backup_archive, last)
         if vr.get("ok"):
             await edit(f"✅ Проверка архива прошла успешно:\n`{last}`", get_backup_menu_keyboard())
         else:
@@ -2749,7 +2763,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_json_file(AUTOHEAL_CONFIG_FILE, autoheal_config)
         await edit(get_autoheal_text(), get_autoheal_keyboard())
     elif d == "autoheal_run_check":
-        alerts = autoheal_tick()
+        alerts = await asyncio.to_thread(autoheal_tick)
         txt = "🧪 Проверка выполнена.\n" + ("\n".join(alerts) if alerts else "Проблем не найдено.")
         await edit(txt, get_autoheal_keyboard())
     elif d == "autoheal_limit_prompt":
@@ -2799,7 +2813,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [[InlineKeyboardButton("❌ Отмена", callback_data="sched_menu")]],
         )
     elif d == "sched_run_due_now":
-        events = scheduler_tick()
+        events = await asyncio.to_thread(scheduler_tick)
         await edit("▶️ Выполнено due-задач: " + str(len(events)) + ("\n" + "\n".join(events) if events else ""), scheduler_keyboard())
     elif d.startswith("sched_toggle_"):
         tid = d[len("sched_toggle_"):]
@@ -2818,7 +2832,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not task:
             await edit("❌ Task not found", scheduler_keyboard())
             return
-        ok, msg = execute_scheduler_task(task)
+        ok, msg = await asyncio.to_thread(execute_scheduler_task, task)
         task["last_run_ts"] = now_ts()
         task["last_status"] = ("OK: " if ok else "ERR: ") + str(msg)[:400]
         task["next_run_ts"] = compute_next_run(task)
@@ -2833,14 +2847,14 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit("🗑 Удалено.", scheduler_keyboard())
 
     elif d == "status":
-        stats = get_system_stats()
+        stats = await asyncio.to_thread(get_system_stats)
         await edit(stats, [[
             InlineKeyboardButton("🔄 Обновить", callback_data="status"),
             InlineKeyboardButton("📋 Процессы", callback_data="processes")
         ]])
 
     elif d == "sysinfo":
-        info = host_collect_sysinfo()
+        info = await asyncio.to_thread(host_collect_sysinfo)
         if not info.get("ok"):
             await edit(f"❌ Ошибка sysinfo: `{info.get('error') or info}`")
             return
@@ -2853,7 +2867,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cpu_phys = info.get("cpu_phys") or 0
         cpu_log = info.get("cpu_log") or 0
         ram_gb = info.get("ram_gb") or 0
-        storage = host_collect_system_metrics(interval_seconds=0.2)
+        storage = await asyncio.to_thread(host_collect_system_metrics, interval_seconds=0.2)
         all_total = int(storage.get("all_disks_total_gb", 0)) if storage.get("ok") else 0
         all_used = int(storage.get("all_disks_used_gb", 0)) if storage.get("ok") else 0
         all_avail = int(storage.get("all_disks_avail_gb", 0)) if storage.get("ok") else 0
@@ -2882,18 +2896,18 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit(text, [[InlineKeyboardButton("🔄 Обновить", callback_data="sysinfo")]])
 
     elif d == "processes":
-        await edit(get_processes(), [[
+        await edit(await asyncio.to_thread(get_processes), [[
             InlineKeyboardButton("🔄 Обновить", callback_data="processes"),
             InlineKeyboardButton("◀️ Назад", callback_data="status")
         ]])
 
     elif d == "network":
-        await edit(get_network_info(), [[
+        await edit(await asyncio.to_thread(get_network_info), [[
             InlineKeyboardButton("🔄 Обновить", callback_data="network")
         ]])
 
     elif d == "services":
-        text, keyboard = get_services()
+        text, keyboard = await asyncio.to_thread(get_services)
         await edit(text, keyboard)
 
     elif d == "journal_menu":
@@ -2907,7 +2921,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if svc not in SERVICES:
             await edit("❌ Неизвестный сервис.")
             return
-        logs = get_systemd_journal_text(svc)
+        logs = await asyncio.to_thread(get_systemd_journal_text, svc)
         await edit(
             f"🧾 *Журнал:* `{svc}`\n\n```\n{logs}\n```",
             [
@@ -2919,14 +2933,14 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif d == "ufw":
-        text = get_ufw_status_text()
+        text = await asyncio.to_thread(get_ufw_status_text)
         await edit(
             f"🧯 *UFW статус*\n\n```\n{text}\n```",
             [[InlineKeyboardButton("🔄 Обновить", callback_data="ufw")]],
         )
 
     elif d == "updates_check":
-        text = get_updates_check_text()
+        text = await asyncio.to_thread(get_updates_check_text)
         await edit(
             "🧰 *Обновления (проверка)*\n\n" f"```\n{text}\n```",
             [
@@ -2961,54 +2975,54 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if svc not in SERVICES:
             await q.answer("Неизвестный сервис.", show_alert=True)
             return
-        host_run(f"sudo -n systemctl start {svc}")
+        await asyncio.to_thread(host_run, f"sudo -n systemctl start {svc}")
         await q.answer(f"▶️ {svc} запускается...", show_alert=True)
-        text, keyboard = get_services()
+        text, keyboard = await asyncio.to_thread(get_services)
         await edit(text, keyboard)
 
     elif d in ("containers", "refresh_containers"):
-        text, keyboard = get_containers_text()
+        text, keyboard = await asyncio.to_thread(get_containers_text)
         if isinstance(keyboard, list):
             await edit(text, keyboard)
 
     elif d.startswith("cinfo_"):
-        text, keyboard = get_container_detail(d[6:])
+        text, keyboard = await asyncio.to_thread(get_container_detail, d[6:])
         await edit(text, keyboard)
 
     elif d.startswith("stop_"):
         try:
-            c = docker_client.containers.get(d[5:])
-            c.stop()
+            c = await asyncio.to_thread(docker_client.containers.get, d[5:])
+            await asyncio.to_thread(c.stop)
             await q.answer(f"⏹ {c.name} остановлен", show_alert=True)
-            text, keyboard = get_containers_text()
+            text, keyboard = await asyncio.to_thread(get_containers_text)
             await edit(text, keyboard)
         except Exception as e:
             await q.answer(f"❌ {e}", show_alert=True)
 
     elif d.startswith("start_"):
         try:
-            c = docker_client.containers.get(d[6:])
-            c.start()
+            c = await asyncio.to_thread(docker_client.containers.get, d[6:])
+            await asyncio.to_thread(c.start)
             await q.answer(f"▶️ {c.name} запущен", show_alert=True)
-            text, keyboard = get_containers_text()
+            text, keyboard = await asyncio.to_thread(get_containers_text)
             await edit(text, keyboard)
         except Exception as e:
             await q.answer(f"❌ {e}", show_alert=True)
 
     elif d.startswith("restart_"):
         try:
-            c = docker_client.containers.get(d[8:])
-            c.restart()
+            c = await asyncio.to_thread(docker_client.containers.get, d[8:])
+            await asyncio.to_thread(c.restart)
             await q.answer(f"🔄 {c.name} перезапущен", show_alert=True)
-            text, keyboard = get_container_detail(d[8:])
+            text, keyboard = await asyncio.to_thread(get_container_detail, d[8:])
             await edit(text, keyboard)
         except Exception as e:
             await q.answer(f"❌ {e}", show_alert=True)
 
     elif d.startswith("logs_"):
         try:
-            c = docker_client.containers.get(d[5:])
-            logs = c.logs(tail=60).decode("utf-8", errors="replace")
+            c = await asyncio.to_thread(docker_client.containers.get, d[5:])
+            logs = (await asyncio.to_thread(c.logs, tail=60)).decode("utf-8", errors="replace")
             if not logs.strip():
                 logs = "(логи пусты)"
             logs = truncate_long_output(logs, max_total=3500, head_chars=1600, tail_chars=1700)
@@ -3026,7 +3040,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         command = d[4:]
         context.user_data["last_shell_cmd"] = command
         try:
-            emoji, output = run_shell_command(command, timeout=30)
+            emoji, output = await asyncio.to_thread(run_shell_command, command, timeout=30)
             await edit(
                 f"{emoji} `$ {command}`\n```\n{output}\n```",
                 [[InlineKeyboardButton("🔁 Повторить", callback_data="rep_last_shell")]],
@@ -3040,7 +3054,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await edit("Нет последней команды.")
             return
         try:
-            emoji, output = run_shell_command(command, timeout=30)
+            emoji, output = await asyncio.to_thread(run_shell_command, command, timeout=30)
             await edit(
                 f"{emoji} `$ {command}`\n```\n{output}\n```",
                 [[InlineKeyboardButton("🔁 Повторить", callback_data="rep_last_shell")]],
@@ -3227,20 +3241,18 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE):
         return False
 
     alerts = []
-    metrics = host_collect_system_metrics(interval_seconds=1.0)
-    if not metrics.get("ok"):
-        return
+    metrics = await asyncio.to_thread(host_collect_system_metrics, interval_seconds=1.0)
+    if metrics.get("ok"):
+        cpu = float(metrics.get("cpu_percent", 0.0))
+        ram = float(metrics.get("ram_percent", 0.0))
+        disk_pct = float(metrics.get("disk_percent", 0.0))
 
-    cpu = float(metrics.get("cpu_percent", 0.0))
-    ram = float(metrics.get("ram_percent", 0.0))
-    disk_pct = float(metrics.get("disk_percent", 0.0))
-
-    if cpu > 90 and should_alert('cpu'):
-        alerts.append(f"🔥 CPU: `{cpu:.1f}%`")
-    if ram > 90 and should_alert('ram'):
-        alerts.append(f"🔥 RAM: `{ram:.1f}%`")
-    if disk_pct > 90 and should_alert('disk'):
-        alerts.append(f"🔥 Диск: `{disk_pct:.1f}%`")
+        if cpu > 90 and should_alert('cpu'):
+            alerts.append(f"🔥 CPU: `{cpu:.1f}%`")
+        if ram > 90 and should_alert('ram'):
+            alerts.append(f"🔥 RAM: `{ram:.1f}%`")
+        if disk_pct > 90 and should_alert('disk'):
+            alerts.append(f"🔥 Диск: `{disk_pct:.1f}%`")
 
     if docker_client:
         pending_docker_alerts = []
@@ -3270,7 +3282,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE):
 
     # Автопочинка сервисов (по конфигу).
     try:
-        autoheal_events = autoheal_tick()
+        autoheal_events = await asyncio.to_thread(autoheal_tick)
         for ev in autoheal_events:
             if should_alert(f"ah_{ev}", 15):
                 alerts.append(ev)
@@ -3280,7 +3292,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE):
 
     # Планировщик фоновых задач.
     try:
-        sch_events = scheduler_tick()
+        sch_events = await asyncio.to_thread(scheduler_tick)
         for ev in sch_events:
             if should_alert(f"sch_{ev}", 10):
                 alerts.append(ev)
