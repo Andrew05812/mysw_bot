@@ -1136,10 +1136,11 @@ def tgv_mtproxy_text() -> str:
     pe = "\U0001F7E2" if proc else "\U0001F534"
     pte = "\U0001F7E2" if port == "open" else "\U0001F534"
     he = "\U0001F7E2" if health.get("telegram") is True else "\U0001F534"
+    proc_label = "\u0437\u0430\u043f\u0443\u0449\u0435\u043d" if proc else "\u043e\u0442\u0441\u0443\u0442\u0441\u0442\u0432\u0443\u0435\u0442"
     return (
         "\U0001F50C *TG-VIDEO \u2014 MTProxy*\n\n"
         f"{ce} \u041a\u043e\u043d\u0442\u0435\u0439\u043d\u0435\u0440 `tg-ws-proxy-test`: `{cstate}`\n"
-        f"{pe} \u041f\u0440\u043e\u0446\u0435\u0441\u0441: `{'\u0437\u0430\u043f\u0443\u0449\u0435\u043d' if proc else '\u043e\u0442\u0441\u0443\u0442\u0441\u0442\u0432\u0443\u0435\u0442'}`\n"
+        f"{pe} \u041f\u0440\u043e\u0446\u0435\u0441\u0441: `{proc_label}`\n"
         f"{pte} \u041f\u043e\u0440\u0442 `{TGV_MT_PROXY}`: `{port}`\n"
         f"{he} Telegram (tg-video): `{health.get('telegram')}`\n"
     )
