@@ -92,6 +92,16 @@ def user_is_admin(user_id):
     return True
 
 SERVICES = ["docker", "cloudflared", "xray", "noip2", "fail2ban", "tor@default", "ssh", "ufw"]
+
+# -- TG-VIDEO section --
+TGV_SERVICE = "tg-video.service"
+TGV_HEALTH_URL = "http://127.0.0.1:8080/healthz"
+TGV_PUBLIC_URL = "https://tg-video-proxy.andrey05812andrey05812.workers.dev/"
+TGV_DB = "/home/adelf/projects/tg-video/data/data.db"
+TGV_DATA_DIR = "/home/adelf/projects/tg-video/data"
+TGV_MT_PROXY = "127.0.0.1:1443"
+TGV_SVC_NAME = "tg-video.service"
+
 alert_cooldown = {}
 command_history = []
 prev_net = psutil.net_io_counters()
@@ -958,6 +968,141 @@ def make_journal_menu_keyboard():
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="services")])
     return keyboard
 
+def tgv_menu_kb():
+    return [
+        [InlineKeyboardButton("📊 Статус", callback_data="tgv_status")],
+        [InlineKeyboardButton("🚀 Открыть Mini App", url=TGV_PUBLIC_URL)],
+        [InlineKeyboardButton("📂 Источники", callback_data="tgv_src"),
+         InlineKeyboardButton("🗂 Категории", callback_data="tgv_cats")],
+        [InlineKeyboardButton("📜 Журнал", callback_data="tgv_log")],
+        [InlineKeyboardButton("💾 Резервная копия", callback_data="tgv_backup")],
+        [InlineKeyboardButton("🛠 Управление службой", callback_data="tgv_svc")],
+        [InlineKeyboardButton("🔄 Обновить", callback_data="tgv_menu")],
+    ]
+
+
+def tgv_svc_kb():
+    return [
+        [InlineKeyboardButton("▶️ Старт", callback_data="tgv_svc_start"),
+         InlineKeyboardButton("⏹ Стоп", callback_data="tgv_svc_stop")],
+        [InlineKeyboardButton("🔄 Рестарт", callback_data="tgv_svc_restart")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")],
+    ]
+
+
+def tgv_query_health() -> str:
+    """Возвращает 'true'/'false'/'unreachable' по /healthz."""
+    try:
+        out = host_run(f"curl -fsS --max-time 6 {TGV_HEALTH_URL}", timeout=12)
+        if not out:
+            return "false"
+        return "true" if "telegram_connected" in out else "false"
+    except Exception:
+        return "unreachable"
+
+
+def tgv_status_text() -> str:
+    active = (host_run(f"systemctl is-active {TGV_SERVICE}", timeout=15) or "unknown").strip()
+    started = (host_run(f"systemctl show {TGV_SERVICE} -p ActiveEnterTimestamp --value", timeout=15) or "unknown").strip()
+    health = tgv_query_health()
+    api = host_run(f"curl -fsS -o /dev/null -w '%{{http_code}}' --max-time 6 {TGV_HEALTH_URL}", timeout=12).strip()
+    if not api or not api.isdigit():
+        api = "unreachable"
+    mt = host_run(
+        f"timeout 2 bash -c 'cat < /dev/null > /dev/tcp/{TGV_MT_PROXY}' && echo open || echo closed",
+        timeout=10,
+    ).strip()
+
+    svc_emoji = "🟢" if active == "active" else "🔴"
+    h_emoji = "🟢" if health == "true" else ("🟠" if health == "false" else "🔴")
+    a_emoji = "🟢" if api.isdigit() and api.startswith("2") else "🔴"
+    m_emoji = "🟢" if mt == "open" else "🔴"
+
+    return (
+        "🎬 *TG-VIDEO — статус*\n\n"
+        f"{svc_emoji} Служба: `{active}`\n"
+        f"🕒 Старт: `{started}`\n"
+        f"{h_emoji} Telegram connected: `{health}`\n"
+        f"{a_emoji} Локальный API: `{api}`\n"
+        f"{m_emoji} MTProxy `{TGV_MT_PROXY}`: `{mt}`\n"
+        f"🔗 Mini App: [открыть]({TGV_PUBLIC_URL})"
+    )
+
+
+def tgv_sources_text() -> str:
+    out = host_run(
+        "python3 -c \"import sqlite3;c=sqlite3.connect('/home/adelf/projects/tg-video/data/data.db');"
+        "print(c.execute('SELECT COUNT(*) FROM sources').fetchone()[0]);"
+        "print(c.execute('SELECT COUNT(*) FROM sent').fetchone()[0])\"",
+        timeout=20,
+    )
+    parts = (out or "").split()
+    srcs = parts[0] if len(parts) > 0 else "?"
+    sent = parts[1] if len(parts) > 1 else "?"
+    return (
+        "📂 *TG-VIDEO — источники*\n\n"
+        f"🔢 Источников: `{srcs}`\n"
+        f"📤 Отправлено: `{sent}`\n\n"
+        "Полное редактирование — в Mini App.\n"
+        f"🔗 [Открыть Mini App]({TGV_PUBLIC_URL})"
+    )
+
+
+def tgv_categories_text() -> str:
+    sql = ("SELECT c.id,c.name,c.topic_id,COUNT(s.channel_id) FROM categories c "
+           "LEFT JOIN sources s ON s.category_id=c.id GROUP BY c.id ORDER BY c.id")
+    out = host_run(
+        "python3 -c \"import sqlite3;c=sqlite3.connect('/home/adelf/projects/tg-video/data/data.db');"
+        "[print(r[0],r[1],r[2],r[3]) for r in c.execute('" + sql + "')]\"",
+        timeout=20,
+    )
+    lines = (out or "").splitlines()
+    if not lines:
+        return "🗂 *TG-VIDEO — категории*\n\nКатегории не найдены."
+    rows = []
+    for ln in lines:
+        p = ln.split()
+        if len(p) >= 4:
+            rows.append((p[0], p[1], p[2], p[3]))
+    text = f"🗂 *TG-VIDEO — категории ({len(rows)})*\n\n"
+    for cid, name, topic, cnt in rows:
+        text += f"• `{name}` — topic `{topic}`, источников `{cnt}`\n"
+    text += "\nРедактирование категорий — в Mini App."
+    return text
+
+
+def tgv_log_text() -> str:
+    out = host_run(
+        f"journalctl -u {TGV_SERVICE} -n 25 --no-pager --output=short-iso-precise 2>&1",
+        timeout=20,
+    )
+    out = sanitize_codeblock(out).strip()
+    if not out:
+        out = "(логи пусты)"
+    out = truncate_long_output(out, max_total=3500, head_chars=1500, tail_chars=1700)
+    return out
+
+
+def tgv_backup() -> str:
+    cmd = (
+        "python3 -c \"import sqlite3,datetime,os;"
+        "src='/home/adelf/projects/tg-video/data/data.db';"
+        "dst='/home/adelf/projects/tg-video/data/backup-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'.db';"
+        "c=sqlite3.connect(src);d=sqlite3.connect(dst);c.backup(d);d.close();c.close();"
+        "print(dst);print(os.path.getsize(dst))\""
+    )
+    out = host_run(cmd, timeout=30)
+    lines = (out or "").splitlines()
+    path = lines[0] if lines else "?"
+    size = lines[1] if len(lines) > 1 else "?"
+    return (
+        "💾 *TG-VIDEO — резервная копия*\n\n"
+        f"📄 Файл: `{path}`\n"
+        f"📦 Размер: `{size}` байт\n\n"
+        "Снимок создан через `sqlite3 .backup` (консистентный)."
+    )
+
+
 def get_ufw_status_text() -> str:
     out = host_run("sudo -n ufw status verbose 2>&1 | awk 'NR<=250{print}'", timeout=20)
     out = sanitize_codeblock(out).strip()
@@ -1792,6 +1937,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧩 Плагины — расширяемые команды\n\n"
         "⚠️ Опасные действия подтверждаются паролем\n\n"
         "📁 Файлы — файловый менеджер (просмотр, копирование, перенос, удаление, переход по пути)\n"
+        "🎬 TG-VIDEO — статус, источники, категории, журнал, бэкап, управление службой\n"
         "🔐 Выйти из аккаунта — завершить сессию, вход снова по паролю\n\n"
         "В терминале просто пиши команды!",
         parse_mode="Markdown",
@@ -2305,6 +2451,19 @@ async def run_shell(update: Update, context: ContextTypes.DEFAULT_TYPE, command:
 # CALLBACK ОБРАБОТЧИК
 # ═══════════════════════════════════════════════════════════════
 
+async def tgvideo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not user_is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Доступ запрещен.")
+        return
+    await update.message.reply_text(
+        "🎬 *TG-VIDEO*\n\n"
+        "Управление сервисом TG-VIDEO: статус, источники, категории, "
+        "резервные копии и управление службой.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(tgv_menu_kb()),
+    )
+
+
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     d = q.data
@@ -2625,6 +2784,48 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await edit(f"❌ Ошибка файлового менеджера: `{e}`")
         return
         # end fs handler
+
+    # TG-VIDEO раздел
+    if d.startswith("tgv_"):
+        try:
+            if d == "tgv_menu":
+                await edit("🎬 *TG-VIDEO*\n\nВыберите действие:", tgv_menu_kb())
+            elif d == "tgv_status":
+                await edit(await asyncio.to_thread(tgv_status_text),
+                           [[InlineKeyboardButton("🔄 Обновить", callback_data="tgv_status"),
+                             InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")]])
+            elif d == "tgv_src":
+                await edit(await asyncio.to_thread(tgv_sources_text),
+                           [[InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")]])
+            elif d == "tgv_cats":
+                await edit(await asyncio.to_thread(tgv_categories_text),
+                           [[InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")]])
+            elif d == "tgv_log":
+                log = await asyncio.to_thread(tgv_log_text)
+                await edit("📜 *Журнал:* `tg-video.service`\n\n```\n" + log + "\n```",
+                           [[InlineKeyboardButton("🔄 Обновить", callback_data="tgv_log"),
+                             InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")]])
+            elif d == "tgv_backup":
+                await edit(await asyncio.to_thread(tgv_backup),
+                           [[InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")]])
+            elif d == "tgv_svc":
+                await edit("🛠 *Управление службой* `tg-video.service`\n\nВыберите действие:",
+                           tgv_svc_kb())
+            elif d == "tgv_svc_start":
+                await asyncio.to_thread(host_run, f"sudo -n systemctl start {TGV_SERVICE}")
+                await q.answer("▶️ Запуск...", show_alert=True)
+                await edit(await asyncio.to_thread(tgv_status_text), tgv_svc_kb())
+            elif d == "tgv_svc_stop":
+                await asyncio.to_thread(host_run, f"sudo -n systemctl stop {TGV_SERVICE}")
+                await q.answer("⏹ Остановка...", show_alert=True)
+                await edit(await asyncio.to_thread(tgv_status_text), tgv_svc_kb())
+            elif d == "tgv_svc_restart":
+                await asyncio.to_thread(host_run, f"sudo -n systemctl restart {TGV_SERVICE}")
+                await q.answer("🔄 Перезапуск...", show_alert=True)
+                await edit(await asyncio.to_thread(tgv_status_text), tgv_svc_kb())
+        except Exception as e:
+            await edit(f"❌ Ошибка TG-VIDEO: `{e}`")
+        return
 
     if d == "backup_menu":
         await edit(get_backup_menu_text(), get_backup_menu_keyboard())
@@ -3420,6 +3621,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("logout", logout_handler))
     app.add_handler(CommandHandler("terminal", terminal_handler))
     app.add_handler(CommandHandler("help", help_handler))
+    app.add_handler(CommandHandler("tgvideo", tgvideo_handler))
     app.add_handler(CallbackQueryHandler(callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
