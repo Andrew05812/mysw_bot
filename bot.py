@@ -1146,6 +1146,13 @@ def tgv_mtproxy_text() -> str:
     )
 
 def tgv_mt_restart() -> str:
+    # \u0421\u043d\u0430\u0447\u0430\u043b\u0430 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430: \u043d\u0435 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0435\u043c \u0438\u0441\u043f\u0440\u0430\u0432\u043d\u044b\u0439 \u043f\u0440\u043e\u043a\u0441\u0438 \u0431\u0435\u0437 \u043d\u0435\u043e\u0431\u0445\u043e\u0434\u0438\u043c\u043e\u0441\u0442\u0438.
+    cstate = (host_run("docker inspect -f '{{.State.Running}}' tg-ws-proxy-test", timeout=15) or "").strip()
+    port = host_run(f"timeout 2 bash -c 'cat < /dev/null > /dev/tcp/{TGV_MT_PROXY}' && echo open || echo closed", timeout=10).strip()
+    hb = tgv_query_health()
+    if cstate == "true" and port == "open" and hb.get("telegram") is True:
+        return "\u2705 MTProxy \u0438\u0441\u043f\u0440\u0430\u0432\u0435\u043d: \u043a\u043e\u043d\u0442\u0435\u0439\u043d\u0435\u0440 \u0437\u0430\u043f\u0443\u0449\u0435\u043d, \u043f\u043e\u0440\u0442 \u043e\u0442\u043a\u0440\u044b\u0442, Telegram \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d. \u041f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a \u043d\u0435 \u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f."
+
     host_run("docker restart tg-ws-proxy-test", timeout=90)
     import time
     ok = False
@@ -1155,9 +1162,15 @@ def tgv_mt_restart() -> str:
             break
         time.sleep(1)
     host_run(f"sudo -n systemctl restart {TGV_SERVICE}", timeout=60)
-    if ok:
-        return "\u2705 MTProxy \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0449\u0435\u043d, \u043f\u043e\u0440\u0442 \u043e\u0442\u043a\u0440\u044b\u0442, tg-video \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0449\u0435\u043d."
-    return "\u26a0\ufe0f MTProxy \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0449\u0435\u043d, \u043d\u043e \u043f\u043e\u0440\u0442 \u043d\u0435 \u043f\u043e\u044f\u0432\u0438\u043b\u0441\u044f. \u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u0432\u0440\u0443\u0447\u043d\u0443\u044e."
+    import time
+    time.sleep(2)
+    health_after = tgv_query_health()
+    tg_ok = health_after.get("telegram") is True
+    if ok and tg_ok:
+        return "\u2705 MTProxy \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0449\u0435\u043d, \u043f\u043e\u0440\u0442 \u043e\u0442\u043a\u0440\u044b\u0442, tg-video \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0449\u0435\u043d, Telegram \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d."
+    if not ok:
+        return "\u26a0\ufe0f MTProxy \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0449\u0435\u043d, \u043d\u043e \u043f\u043e\u0440\u0442 \u043d\u0435 \u043f\u043e\u044f\u0432\u0438\u043b\u0441\u044f. \u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u0432\u0440\u0443\u0447\u043d\u0443\u044e."
+    return "\u26a0\ufe0f \u041f\u043e\u0440\u0442 \u043e\u0442\u043a\u0440\u044b\u0442, \u043d\u043e Telegram \u043d\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d. \u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u0435 tg-video."
 
 
 
@@ -1188,7 +1201,22 @@ def tgv_backups_text() -> str:
     return body
 
 def tgv_backup_now() -> str:
-    return tgv_backup()
+    # \u0428\u0442\u0430\u0442\u043d\u044b\u0439 systemd-\u043c\u0435\u0445\u0430\u043d\u0438\u0437\u043c: tg-video-backup.service
+    out = host_run(f"sudo -n systemctl start {TGV_BACKUP_SERVICE} && systemctl show {TGV_BACKUP_SERVICE} -p Result --value && systemctl show {TGV_BACKUP_SERVICE} -p ExecMainStatus --value", timeout=90)
+    # ExecMainStatus 0 \u0437\u043d\u0430\u0447\u0438\u0442 \u0443\u0441\u043f\u0435\u0445
+    result = "ok"
+    main = None
+    for ln in (out or "").splitlines():
+        ln = ln.strip()
+        if ln in ("success", "failed", "exit-code"):
+            result = ln
+        elif ln.isdigit():
+            main = ln
+    if result != "success" or main not in (None, "0"):
+        return ("\U0001F4BE *TG-VIDEO \u2014 \u0440\u0435\u0437\u0435\u0440\u0432\u043d\u043e\u0435 \u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0435*\n\n"
+                "\u274c \u0421\u043b\u0443\u0436\u0431\u0430 \u0432\u0435\u0440\u043d\u0443\u043b\u0430 Result=`" + str(result) + "` ExecMainStatus=`" + str(main) + "`\n"
+                "\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u043e\u0441\u0442\u0438 \u0432: `journalctl -u tg-video-backup.service -n 20`")
+    return tgv_backups_text()
 
 
 def get_ufw_status_text() -> str:
@@ -2912,6 +2940,18 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await edit(f"❌ Ошибка файлового менеджера: `{e}`")
         return
         # end fs handler
+
+    # Раздел "Приложения" (callback data начинается с app_)
+    if d.startswith("app_"):
+        try:
+            if d == "apps_back":
+                await edit("\U0001F4F1 *\u041f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u044f*\n\n\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435:", apps_kb())
+            elif d == "app_tgvideo":
+                await edit("\U0001F3AC *TG-VIDEO*\n\n\u0423\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435 \u0441\u0435\u0440\u0432\u0438\u0441\u043e\u043c TG-VIDEO: \u0441\u0442\u0430\u0442\u0443\u0441, \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0438, \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438, \u0440\u0435\u0437\u0435\u0440\u0432\u043d\u044b\u0435 \u043a\u043e\u043f\u0438\u0438 \u0438 \u0443\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435 \u0441\u043b\u0443\u0436\u0431\u043e\u0439.", tgv_menu_kb())
+        except Exception as e:
+            await edit("\u274c \u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0439: `" + str(e) + "`")
+        return
+
 
     # TG-VIDEO раздел
     if d.startswith("tgv_"):
