@@ -990,15 +990,21 @@ def tgv_svc_kb():
     ]
 
 
-def tgv_query_health() -> str:
-    """Возвращает 'true'/'false'/'unreachable' по /healthz."""
+def tgv_query_health() -> dict:
+    """\u0420\u0430\u0437\u0431\u0438\u0440\u0430\u0435\u0442 /healthz \u043a\u0430\u043a JSON. {api, telegram, status}."""
+    out = host_run(f"curl -fsS --max-time 6 {TGV_HEALTH_URL}", timeout=12)
+    if not out:
+        return {"api": "unreachable", "telegram": None, "status": None}
+    if out.startswith(("\u274c", "\u23f0")):
+        return {"api": "error", "telegram": None, "status": None, "raw": out[:200]}
     try:
-        out = host_run(f"curl -fsS --max-time 6 {TGV_HEALTH_URL}", timeout=12)
-        if not out:
-            return "false"
-        return "true" if "telegram_connected" in out else "false"
+        data = json.loads(out)
     except Exception:
-        return "unreachable"
+        return {"api": "error", "telegram": None, "status": None, "raw": out[:200]}
+    api = "ok" if data.get("status") == "ok" else "down"
+    tg = data.get("telegram_connected")
+    return {"api": api, "telegram": bool(tg) if tg is not None else None,
+            "status": data.get("status")}
 
 
 def tgv_status_text() -> str:
@@ -1013,19 +1019,23 @@ def tgv_status_text() -> str:
         timeout=10,
     ).strip()
 
-    svc_emoji = "🟢" if active == "active" else "🔴"
-    h_emoji = "🟢" if health == "true" else ("🟠" if health == "false" else "🔴")
-    a_emoji = "🟢" if api.isdigit() and api.startswith("2") else "🔴"
-    m_emoji = "🟢" if mt == "open" else "🔴"
+    svc_emoji = "\U0001F7E2" if active == "active" else "\U0001F534"
+    hapi = health.get("api")
+    a_emoji = "\U0001F7E2" if hapi == "ok" else ("\U0001F7E0" if hapi == "down" else "\U0001F534")
+    tg = health.get("telegram")
+    h_emoji = "\U0001F7E2" if tg is True else ("\U0001F534" if tg is False else "\U0001F7E0")
+    api2_emoji = "\U0001F7E2" if api.isdigit() and api.startswith("2") else "\U0001F534"
+    m_emoji = "\U0001F7E2" if mt == "open" else "\U0001F534"
 
     return (
-        "🎬 *TG-VIDEO — статус*\n\n"
-        f"{svc_emoji} Служба: `{active}`\n"
-        f"🕒 Старт: `{started}`\n"
-        f"{h_emoji} Telegram connected: `{health}`\n"
-        f"{a_emoji} Локальный API: `{api}`\n"
+        "\U0001F3AC *TG-VIDEO \u2014 \u0441\u0442\u0430\u0442\u0443\u0441*\n\n"
+        f"{svc_emoji} \u0421\u043b\u0443\u0436\u0431\u0430: `{active}`\n"
+        f"\U0001F552 \u0421\u0442\u0430\u0440\u0442: `{started}`\n"
+        f"{a_emoji} API: `{hapi}`\n"
+        f"{h_emoji} Telegram connected: `{tg}`\n"
+        f"{api2_emoji} \u041b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0439 API: `{api}`\n"
         f"{m_emoji} MTProxy `{TGV_MT_PROXY}`: `{mt}`\n"
-        f"🔗 Mini App: [открыть]({TGV_PUBLIC_URL})"
+        f"\U0001F517 Mini App: [\u043e\u0442\u043a\u0440\u044b\u0442\u044c]({TGV_PUBLIC_URL})"
     )
 
 
@@ -1049,25 +1059,24 @@ def tgv_sources_text() -> str:
 
 
 def tgv_categories_text() -> str:
-    sql = ("SELECT c.id,c.name,c.topic_id,COUNT(s.channel_id) FROM categories c "
-           "LEFT JOIN sources s ON s.category_id=c.id GROUP BY c.id ORDER BY c.id")
-    out = host_run(
-        "python3 -c \"import sqlite3;c=sqlite3.connect('/home/adelf/projects/tg-video/data/data.db');"
-        "[print(r[0],r[1],r[2],r[3]) for r in c.execute('" + sql + "')]\"",
-        timeout=20,
+    py = (
+        "import sqlite3,json;c=sqlite3.connect('/home/adelf/projects/tg-video/data/data.db');"
+        "c.row_factory=sqlite3.Row;"
+        "print(json.dumps([dict(r) for r in c.execute("
+        "'SELECT c.id,c.name,c.topic_id,COUNT(s.channel_id) AS cnt FROM categories c "
+        "LEFT JOIN sources s ON s.category_id=c.id GROUP BY c.id ORDER BY c.id')]))"
     )
-    lines = (out or "").splitlines()
-    if not lines:
-        return "🗂 *TG-VIDEO — категории*\n\nКатегории не найдены."
-    rows = []
-    for ln in lines:
-        p = ln.split()
-        if len(p) >= 4:
-            rows.append((p[0], p[1], p[2], p[3]))
-    text = f"🗂 *TG-VIDEO — категории ({len(rows)})*\n\n"
-    for cid, name, topic, cnt in rows:
-        text += f"• `{name}` — topic `{topic}`, источников `{cnt}`\n"
-    text += "\nРедактирование категорий — в Mini App."
+    data = host_run_json(f"python3 -c {shlex.quote(py)}", timeout=20)
+    rows = data if isinstance(data, list) else []
+    if not rows:
+        return "\U0001F5C2 *TG-VIDEO \u2014 \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438*\n\n\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u044b \u0438\u043b\u0438 \u0411\u0414 \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430."
+    text = "\U0001F5C2 *TG-VIDEO \u2014 \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438 ({})*\n\n".format(len(rows))
+    for r in rows:
+        name = r.get("name", "?")
+        topic = r.get("topic_id", "?")
+        cnt = r.get("cnt", "?")
+        text += "\u2022 `{}` \u2014 topic `{}`, \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u043e\u0432 `{}`\n".format(name, topic, cnt)
+    text += "\n\u0420\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0435 \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0439 \u2014 \u0432 Mini App."
     return text
 
 
@@ -1084,23 +1093,29 @@ def tgv_log_text() -> str:
 
 
 def tgv_backup() -> str:
-    cmd = (
-        "python3 -c \"import sqlite3,datetime,os;"
-        "src='/home/adelf/projects/tg-video/data/data.db';"
-        "dst='/home/adelf/projects/tg-video/data/backup-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'.db';"
-        "c=sqlite3.connect(src);d=sqlite3.connect(dst);c.backup(d);d.close();c.close();"
-        "print(dst);print(os.path.getsize(dst))\""
-    )
-    out = host_run(cmd, timeout=30)
-    lines = (out or "").splitlines()
-    path = lines[0] if lines else "?"
-    size = lines[1] if len(lines) > 1 else "?"
-    return (
-        "💾 *TG-VIDEO — резервная копия*\n\n"
-        f"📄 Файл: `{path}`\n"
-        f"📦 Размер: `{size}` байт\n\n"
-        "Снимок создан через `sqlite3 .backup` (консистентный)."
-    )
+    """\u0417\u0430\u043f\u0443\u0441\u043a\u0430\u0435\u0442 \u0446\u0435\u043d\u0442\u0440\u0430\u043b\u0438\u0437\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0431\u044d\u043a\u0430\u043f \u0438 \u043f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u0435\u0442 \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442."""
+    out = host_run("/usr/bin/python3 /home/adelf/bin/backup_tg_video_db.py", timeout=60)
+    ok = False
+    path = "?"
+    size = "?"
+    integrity = "?"
+    for ln in (out or "").splitlines():
+        if ln.startswith("Backup OK:"):
+            ok = True
+            path = ln.split("Backup OK:", 1)[1].strip()
+        elif ln.startswith("Size:"):
+            size = ln.split("Size:", 1)[1].strip()
+        elif ln.startswith("Integrity:"):
+            integrity = ln.split("Integrity:", 1)[1].strip()
+    if not ok:
+        return ("\U0001F4BE *TG-VIDEO \u2014 \u0440\u0435\u0437\u0435\u0440\u0432\u043d\u0430\u044f \u043a\u043e\u043f\u0438\u044f*\n\n"
+                "\u274c \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0432\u044b\u043f\u043e\u043b\u043d\u0438\u0442\u044c \u0440\u0435\u0437\u0435\u0440\u0432\u043d\u043e\u0435 \u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0435:\n`"
+                + truncate_long_output(out or "(\u043f\u0443\u0441\u0442\u043e)", max_total=600) + "`")
+    return ("\U0001F4BE *TG-VIDEO \u2014 \u0440\u0435\u0437\u0435\u0440\u0432\u043d\u0430\u044f \u043a\u043e\u043f\u0438\u044f*\n\n"
+            "\u2705 \u0424\u0430\u0439\u043b: `" + path + "`\n"
+            "\U0001F4E6 \u0420\u0430\u0437\u043c\u0435\u0440: `" + size + "`\n"
+            "\U0001F6E1 \u0426\u0435\u043b\u043e\u0441\u0442\u043d\u043e\u0441\u0442\u044c: `" + integrity + "`\n\n"
+            "\u041a\u043e\u043f\u0438\u0438: `/home/adelf/backups/tg-video/` (\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u0435 30 \u0434\u043d\u0435\u0439)")
 
 
 def get_ufw_status_text() -> str:
