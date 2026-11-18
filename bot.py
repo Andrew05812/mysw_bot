@@ -18,7 +18,7 @@ _SCHEDULER_LOCK = threading.RLock()
 import psutil
 import docker
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 def host_run(command, timeout=10):
@@ -971,11 +971,12 @@ def make_journal_menu_keyboard():
 def tgv_menu_kb():
     return [
         [InlineKeyboardButton("📊 Статус", callback_data="tgv_status")],
-        [InlineKeyboardButton("🚀 Открыть Mini App", url=TGV_PUBLIC_URL)],
+        [InlineKeyboardButton("🚀 Открыть Mini App", web_app=WebAppInfo(url=TGV_PUBLIC_URL))],
         [InlineKeyboardButton("📂 Источники", callback_data="tgv_src"),
          InlineKeyboardButton("🗂 Категории", callback_data="tgv_cats")],
         [InlineKeyboardButton("📜 Журнал", callback_data="tgv_log")],
-        [InlineKeyboardButton("💾 Резервная копия", callback_data="tgv_backup")],
+        [InlineKeyboardButton("💾 Резервные копии", callback_data="tgv_backups")],
+        [InlineKeyboardButton("🔌 MTProxy", callback_data="tgv_mtproxy")],
         [InlineKeyboardButton("🛠 Управление службой", callback_data="tgv_svc")],
         [InlineKeyboardButton("🔄 Обновить", callback_data="tgv_menu")],
     ]
@@ -1116,6 +1117,77 @@ def tgv_backup() -> str:
             "\U0001F4E6 \u0420\u0430\u0437\u043c\u0435\u0440: `" + size + "`\n"
             "\U0001F6E1 \u0426\u0435\u043b\u043e\u0441\u0442\u043d\u043e\u0441\u0442\u044c: `" + integrity + "`\n\n"
             "\u041a\u043e\u043f\u0438\u0438: `/home/adelf/backups/tg-video/` (\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u0435 30 \u0434\u043d\u0435\u0439)")
+
+
+
+def tgv_mtproxy_kb():
+    return [
+        [InlineKeyboardButton("\U0001F501 \u041f\u0435\u0440\u0435\u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c", callback_data="tgv_mt_restart")],
+        [InlineKeyboardButton("\U0001F504 \u041e\u0431\u043d\u043e\u0432\u0438\u0442\u044c", callback_data="tgv_mtproxy")],
+        [InlineKeyboardButton("\u25c0\ufe0f \u041d\u0430\u0437\u0430\u0434", callback_data="tgv_menu")],
+    ]
+
+def tgv_mtproxy_text() -> str:
+    cstate = (host_run("docker inspect -f '{{.State.Running}}' tg-ws-proxy-test", timeout=15) or "?").strip()
+    proc = (host_run("pgrep -f tg_ws_proxy | head -1", timeout=10) or "").strip()
+    port = host_run(f"timeout 2 bash -c 'cat < /dev/null > /dev/tcp/{TGV_MT_PROXY}' && echo open || echo closed", timeout=10).strip()
+    health = tgv_query_health()
+    ce = "\U0001F7E2" if cstate == "true" else "\U0001F534"
+    pe = "\U0001F7E2" if proc else "\U0001F534"
+    pte = "\U0001F7E2" if port == "open" else "\U0001F534"
+    he = "\U0001F7E2" if health.get("telegram") is True else "\U0001F534"
+    return (
+        "\U0001F50C *TG-VIDEO \u2014 MTProxy*\n\n"
+        f"{ce} \u041a\u043e\u043d\u0442\u0435\u0439\u043d\u0435\u0440 `tg-ws-proxy-test`: `{cstate}`\n"
+        f"{pe} \u041f\u0440\u043e\u0446\u0435\u0441\u0441: `{'\u0437\u0430\u043f\u0443\u0449\u0435\u043d' if proc else '\u043e\u0442\u0441\u0443\u0442\u0441\u0442\u0432\u0443\u0435\u0442'}`\n"
+        f"{pte} \u041f\u043e\u0440\u0442 `{TGV_MT_PROXY}`: `{port}`\n"
+        f"{he} Telegram (tg-video): `{health.get('telegram')}`\n"
+    )
+
+def tgv_mt_restart() -> str:
+    host_run("docker restart tg-ws-proxy-test", timeout=90)
+    import time
+    ok = False
+    for _ in range(15):
+        if host_run(f"timeout 2 bash -c 'cat < /dev/null > /dev/tcp/{TGV_MT_PROXY}' && echo open || echo closed", timeout=10).strip() == "open":
+            ok = True
+            break
+        time.sleep(1)
+    host_run(f"sudo -n systemctl restart {TGV_SERVICE}", timeout=60)
+    if ok:
+        return "\u2705 MTProxy \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0449\u0435\u043d, \u043f\u043e\u0440\u0442 \u043e\u0442\u043a\u0440\u044b\u0442, tg-video \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0449\u0435\u043d."
+    return "\u26a0\ufe0f MTProxy \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0449\u0435\u043d, \u043d\u043e \u043f\u043e\u0440\u0442 \u043d\u0435 \u043f\u043e\u044f\u0432\u0438\u043b\u0441\u044f. \u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u0432\u0440\u0443\u0447\u043d\u0443\u044e."
+
+
+
+def tgv_backups_kb():
+    return [
+        [InlineKeyboardButton("\U0001F4BE \u0421\u043e\u0437\u0434\u0430\u0442\u044c \u0441\u0435\u0439\u0447\u0430\u0441", callback_data="tgv_backup_now")],
+        [InlineKeyboardButton("\u25c0\ufe0f \u041d\u0430\u0437\u0430\u0434", callback_data="tgv_menu")],
+    ]
+
+def tgv_backups_text() -> str:
+    timer = (host_run("systemctl is-active tg-video-backup.timer", timeout=15) or "?").strip()
+    nxt = (host_run("systemctl show tg-video-backup.timer -p NextElapseUSecRealtime --value", timeout=15) or "?").strip()
+    py = ("import os,glob,time,datetime;"
+          "fs=sorted(glob.glob('/home/adelf/backups/tg-video/tg-video-*.sqlite3'),key=os.path.getmtime,reverse=True)[:3];"
+          "import json;"
+          "print(json.dumps([{'n':os.path.basename(f),'s':os.path.getsize(f),'t':datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M')} for f in fs]))")
+    data = host_run_json(f"python3 -c {shlex.quote(py)}", timeout=20)
+    rows = data if isinstance(data, list) else []
+    body = "\U0001F4BE *TG-VIDEO \u2014 \u0440\u0435\u0437\u0435\u0440\u0432\u043d\u044b\u0435 \u043a\u043e\u043f\u0438\u0438*\n\n"
+    body += f"\u23f1 \u0422\u0430\u0439\u043c\u0435\u0440: `{timer}`\n"
+    body += f"\u23f3 \u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439: `{nxt}`\n\n"
+    if not rows:
+        body += "\u0411\u044d\u043a\u0430\u043f\u043e\u0432 \u043f\u043e\u043a\u0430 \u043d\u0435\u0442."
+    else:
+        for r in rows:
+            body += f"\u2022 `{r.get('n')}`\n   `{r.get('t')}` \u00b7 `{r.get('s')}` \u0431\u0430\u0439\u0442\n"
+    body += "\n\u0426\u0435\u043d\u0442\u0440\u0430\u043b\u0438\u0437\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u043c\u0435\u0445\u0430\u043d\u0438\u0437\u043c (\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u0435 30 \u0434\u043d\u0435\u0439)."
+    return body
+
+def tgv_backup_now() -> str:
+    return tgv_backup()
 
 
 def get_ufw_status_text() -> str:
@@ -1739,6 +1811,7 @@ def main_kb():
         [KeyboardButton("🗄 Бэкапы"), KeyboardButton("🩺 Автопочинка")],
         [KeyboardButton("⏰ Планировщик"), KeyboardButton("🧩 Плагины")],
         [KeyboardButton("📁 Файлы"), KeyboardButton("🩻 Диагностика")],
+        [KeyboardButton("📱 Приложения")],
         [KeyboardButton("🧾 Аудит")],
         [KeyboardButton("🚀 Обновить бота")],
         [KeyboardButton("🔄 Перезагрузить"), KeyboardButton("😴 Suspend")],
@@ -2415,6 +2488,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🩻 Диагностика": diagnostics_handler,
         "🧾 Аудит": audit_handler,
         "🧩 Плагины": plugins_handler,
+        "\U0001F4F1 \u041f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u044f": apps_handler,
         "🚀 Обновить бота": deploy_handler,
         "📁 Файлы": None,
         "🔐 Выйти из аккаунта": logout_handler,
@@ -2466,17 +2540,55 @@ async def run_shell(update: Update, context: ContextTypes.DEFAULT_TYPE, command:
 # CALLBACK ОБРАБОТЧИК
 # ═══════════════════════════════════════════════════════════════
 
-async def tgvideo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── Приложения ────────────────────────────────────────────────────────
+# Расширяемый реестр приложений, управляемых ботом.
+APPS_REGISTRY = [
+    {
+        "id": "tgvideo",
+        "name": "TG-VIDEO",
+        "emoji": "\U0001F3AC",
+        "description": "\u041f\u0430\u043d\u0435\u043b\u044c \u0443\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u044f \u043f\u0435\u0440\u0435\u0441\u044b\u043b\u043a\u043e\u0439 \u0432\u0438\u0434\u0435\u043e",
+        "callback": "app_tgvideo",
+        "admin": True,
+    },
+]
+
+def apps_kb():
+    kb = []
+    for app in APPS_REGISTRY:
+        if app.get("admin") and True:  # admin check happens in handler
+            kb.append([InlineKeyboardButton(f"{app['emoji']} {app['name']}", callback_data=app["callback"])])
+    kb.append([InlineKeyboardButton("\U0001F519 \u041d\u0430\u0437\u0430\u0434", callback_data="apps_back")])
+    return kb
+
+async def apps_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Доступ запрещен.")
+        await update.message.reply_text("\u2b1b \u0414\u043e\u0441\u0442\u0443\u043f \u0437\u0430\u043f\u0440\u0435\u0449\u0435\u043d.")
         return
     await update.message.reply_text(
-        "🎬 *TG-VIDEO*\n\n"
-        "Управление сервисом TG-VIDEO: статус, источники, категории, "
-        "резервные копии и управление службой.",
+        "\U0001F4F1 *\u041f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u044f*\n\n"
+        "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(apps_kb()),
+    )
+
+async def show_tgvideo_menu(context, chat_id):
+    await context.bot.send_message(
+        chat_id,
+        "\U0001F3AC *TG-VIDEO*\n\n"
+        "\u0423\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435 \u0441\u0435\u0440\u0432\u0438\u0441\u043e\u043c TG-VIDEO: "
+        "\u0441\u0442\u0430\u0442\u0443\u0441, \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0438, "
+        "\u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438, \u0440\u0435\u0437\u0435\u0440\u0432\u043d\u044b\u0435 "
+        "\u043a\u043e\u043f\u0438\u0438 \u0438 \u0443\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435 \u0441\u043b\u0443\u0436\u0431\u043e\u0439.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(tgv_menu_kb()),
     )
+
+async def tgvideo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not user_is_admin(update.effective_user.id):
+        await update.message.reply_text("\u2b1b \u0414\u043e\u0441\u0442\u0443\u043f \u0437\u0430\u043f\u0440\u0435\u0449\u0435\u043d.")
+        return
+    await show_tgvideo_menu(context, update.effective_chat.id)
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2823,9 +2935,25 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif d == "tgv_backup":
                 await edit(await asyncio.to_thread(tgv_backup),
                            [[InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")]])
+            elif d == "tgv_mtproxy":
+                await edit(await asyncio.to_thread(tgv_mtproxy_text), tgv_mtproxy_kb())
+            elif d == "tgv_mt_restart":
+                await q.answer("\U0001F501 \u041f\u0435\u0440\u0435\u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435...", show_alert=True)
+                await edit(await asyncio.to_thread(tgv_mt_restart), tgv_mtproxy_kb())
+            elif d == "tgv_backups":
+                await edit(await asyncio.to_thread(tgv_backups_text), tgv_backups_kb())
+            elif d == "tgv_backup_now":
+                await q.answer("\U0001F4BE \u0421\u043e\u0437\u0434\u0430\u043d\u0438\u0435...", show_alert=True)
+                await edit(await asyncio.to_thread(tgv_backup_now), tgv_backups_kb())
+
             elif d == "tgv_svc":
                 await edit("🛠 *Управление службой* `tg-video.service`\n\nВыберите действие:",
                            tgv_svc_kb())
+            elif d == "apps_back":
+                await edit("\U0001F4F1 *\u041f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u044f*\n\n\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435:", apps_kb())
+            elif d == "app_tgvideo":
+                await edit("\U0001F3AC *TG-VIDEO*\n\n\u0423\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435 \u0441\u0435\u0440\u0432\u0438\u0441\u043e\u043c TG-VIDEO: \u0441\u0442\u0430\u0442\u0443\u0441, \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0438, \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438, \u0440\u0435\u0437\u0435\u0440\u0432\u043d\u044b\u0435 \u043a\u043e\u043f\u0438\u0438 \u0438 \u0443\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435 \u0441\u043b\u0443\u0436\u0431\u043e\u0439.", tgv_menu_kb())
+            
             elif d == "tgv_svc_start":
                 await asyncio.to_thread(host_run, f"sudo -n systemctl start {TGV_SERVICE}")
                 await q.answer("▶️ Запуск...", show_alert=True)
