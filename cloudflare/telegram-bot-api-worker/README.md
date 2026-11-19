@@ -75,6 +75,11 @@ execution, and a response body that continues streaming keeps the worker alive.
 So long polling works on the Free plan for typical Telegram `getUpdates` waits;
 no paid plan is required for this.
 
+The Free plan also limits the worker to **100,000 incoming requests/day**. A bot
+that polls constantly (one `getUpdates` every few seconds, plus every message
+and command) can approach this; keep it in mind for capacity planning, but it
+is a per-day request budget, not a per-request wall-clock limit.
+
 Remaining real constraints are on the client and network, not the worker:
 - the bot's HTTP read timeout must exceed Telegram's requested `getUpdates`
   `timeout` (so the client does not close the connection first);

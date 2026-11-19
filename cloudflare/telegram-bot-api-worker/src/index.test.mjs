@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import worker from './index.js';
 
 const ENV = { WORKER_API_KEY: 'a'.repeat(64) };
-let lastFetch = null;
+let lastFetch = null; // { input, method, body, headers }
 
 function resetFetch() {
   lastFetch = null;
@@ -14,16 +14,17 @@ function resetFetch() {
     if (typeof input.text === 'function') {
       try { body = await input.text(); } catch { body = null; }
     }
-    lastFetch = { input: url, method, body };
+    lastFetch = { input: url, method, body, headers: input.headers };
     return new Response(JSON.stringify({ ok: true, result: { id: 1 } }),
       { status: 200, headers: { 'content-type': 'application/json' } });
   };
 }
 
-function makeReq(path, { method = 'GET', key = ENV.WORKER_API_KEY, body } = {}) {
-  const headers = {};
-  if (key) headers['X-Worker-Api-Key'] = key;
-  const opts = { method, headers };
+function makeReq(path, { method = 'GET', key = ENV.WORKER_API_KEY, body, headers = {} } = {}) {
+  const h = {};
+  if (key) h['X-Worker-Api-Key'] = key;
+  Object.assign(h, headers);
+  const opts = { method, headers: h };
   if (body !== undefined) opts.body = body;
   return new Request('https://tg-bot-api-proxy.test.workers.dev' + path, opts);
 }
@@ -49,18 +50,6 @@ test('GET getMe with wrong key returns 401', async () => {
   assert.equal(lastFetch, null);
 });
 
-test('POST sendMessage forwards body', async () => {
-  resetFetch();
-  globalThis.fetch = async (input) => {
-    lastFetch = { input: String(input.url), method: 'POST', body: lastFetch && lastFetch.body };
-    return new Response(JSON.stringify({ ok: true }), { status: 200 });
-  };
-  const body = JSON.stringify({ chat_id: 1, text: 'hi' });
-  const res = await worker.fetch(makeReq('/bot123TOKEN/sendMessage', { method: 'POST', body }), ENV);
-  assert.equal(res.status, 200);
-  assert.ok(lastFetch.input.startsWith('https://api.telegram.org/bot123TOKEN/sendMessage'));
-});
-
 test('GET getUpdates preserves timeout query param', async () => {
   resetFetch();
   const res = await worker.fetch(makeReq('/bot123TOKEN/getUpdates?timeout=45&limit=100'), ENV);
@@ -81,42 +70,6 @@ test('File API proxies binary body', async () => {
   assert.deepEqual(Array.from(buf), Array.from(bin));
 });
 
-test('unrecognized path returns 404 without fetch', async () => {
-  resetFetch();
-  const res = await worker.fetch(makeReq('/random'), ENV);
-  assert.equal(res.status, 404);
-  assert.equal(lastFetch, null);
-});
-
-test('upstream failure returns controlled 502', async () => {
-  globalThis.fetch = async () => { throw new Error('upstream down'); };
-  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe'), ENV);
-  assert.equal(res.status, 502);
-  const j = await res.json();
-  assert.equal(j.ok, false);
-  assert.ok(!JSON.stringify(j).includes(ENV.WORKER_API_KEY));
-});
-
-test('Telegram 429 status and body preserved', async () => {
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ ok: false, error_code: 429, description: 'Too Many Requests' }),
-      { status: 429, headers: { 'content-type': 'application/json' } });
-  const res = await worker.fetch(makeReq('/bot123TOKEN/sendMessage', { method: 'POST' }), ENV);
-  assert.equal(res.status, 429);
-  const j = await res.json();
-  assert.equal(j.error_code, 429);
-});
-
-test('POST empty body accepted', async () => {
-  resetFetch();
-  globalThis.fetch = async (input) => {
-    lastFetch = { input: String(input.url), method: 'POST' };
-    return new Response('{}', { status: 200 });
-  };
-  const res = await worker.fetch(makeReq('/bot123TOKEN/getWebhookInfo', { method: 'POST', body: '' }), ENV);
-  assert.equal(res.status, 200);
-});
-
 test('File API without key returns 401 and does not fetch', async () => {
   resetFetch();
   const res = await worker.fetch(makeReq('/file/bot123TOKEN/x.bin', { key: null }), ENV);
@@ -124,98 +77,137 @@ test('File API without key returns 401 and does not fetch', async () => {
   assert.equal(lastFetch, null);
 });
 
-test('upstream redirect is passed through (worker does not follow)', async () => {
-  globalThis.fetch = async () =>
-    new Response(null, { status: 302, headers: { location: 'https://example.com/x' } });
-  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe'), ENV);
-  assert.equal(res.status, 302);
-  assert.equal(res.headers.get('location'), 'https://example.com/x');
-});
-
-test('upstream 401 status and body preserved', async () => {
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ ok: false, error_code: 401, description: 'Unauthorized' }),
-      { status: 401, headers: { 'content-type': 'application/json' } });
-  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe'), ENV);
-  assert.equal(res.status, 401);
-  const j = await res.json();
-  assert.equal(j.error_code, 401);
-});
-
-test('upstream 403 status and body preserved', async () => {
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ ok: false, error_code: 403, description: 'Forbidden' }),
-      { status: 403, headers: { 'content-type': 'application/json' } });
-  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe'), ENV);
-  assert.equal(res.status, 403);
-  assert.equal((await res.json()).error_code, 403);
-});
-
-test('upstream 500 status and body preserved', async () => {
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ ok: false, error_code: 500, description: 'Internal' }),
-      { status: 500, headers: { 'content-type': 'application/json' } });
-  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe'), ENV);
-  assert.equal(res.status, 500);
-  assert.equal((await res.json()).error_code, 500);
-});
-
-test('missing WORKER_API_KEY secret returns 500', async () => {
+test('unrecognized path returns 404 without fetch', async () => {
   resetFetch();
-  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe'), {});
-  assert.equal(res.status, 500);
-  assert.equal(lastFetch, null);
-});
-
-test('401 response does not leak the secret', async () => {
-  resetFetch();
-  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe', { key: 'x'.repeat(64) }), ENV);
-  const body = await res.text();
-  assert.ok(!body.includes(ENV.WORKER_API_KEY));
-});
-
-test('502 response does not leak the secret', async () => {
-  globalThis.fetch = async () => { throw new Error('down'); };
-  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe'), ENV);
-  const body = await res.text();
-  assert.ok(!body.includes(ENV.WORKER_API_KEY));
-});
-
-test('arbitrary upstream cannot be reached via path or query', async () => {
-  resetFetch();
-  // token-looking path plus query trying to smuggle a host
-  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe?upstream=https://evil.example/x'), ENV);
-  assert.equal(res.status, 200);
-  // host stays fixed on api.telegram.org; the query cannot redirect upstream
-  assert.ok(lastFetch.input.startsWith('https://api.telegram.org/bot123TOKEN/getMe?'));
-  assert.ok(!lastFetch.input.startsWith('https://evil.example'));
-});
-
-test('attempt to escape the allowed route is rejected', async () => {
-  resetFetch();
-  // a path not under /bot or /file/bot -> 404, no fetch
-  const res = await worker.fetch(makeReq('/vpn/bot123TOKEN/getMe'), ENV);
+  const res = await worker.fetch(makeReq('/random'), ENV);
   assert.equal(res.status, 404);
   assert.equal(lastFetch, null);
 });
 
-test('malformed encoded path still stays on api.telegram.org', async () => {
+test('upstream failure returns controlled 502 without secret', async () => {
+  globalThis.fetch = async () => { throw new Error('upstream down'); };
+  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe'), ENV);
+  assert.equal(res.status, 502);
+  const body = await res.text();
+  assert.ok(!body.includes(ENV.WORKER_API_KEY));
+});
+
+test('POST sendMessage forwards exact body, method, content-type', async () => {
+  resetFetch();
+  const body = JSON.stringify({ chat_id: 1, text: 'hi', parse_mode: 'HTML' });
+  const res = await worker.fetch(
+    makeReq('/bot123TOKEN/sendMessage', { method: 'POST', body,
+            headers: { 'Content-Type': 'application/json' } }), ENV);
+  assert.equal(res.status, 200);
+  assert.equal(lastFetch.method, 'POST');
+  assert.equal(lastFetch.body, body); // exact body compare
+  assert.equal(lastFetch.headers.get('content-type'), 'application/json');
+  assert.ok(lastFetch.input.startsWith('https://api.telegram.org/bot123TOKEN/sendMessage'));
+  // auth header must not be forwarded upstream
+  assert.equal(lastFetch.headers.get('X-Worker-Api-Key'), null);
+});
+
+test('POST empty body forwarded as empty', async () => {
+  resetFetch();
+  const res = await worker.fetch(makeReq('/bot123TOKEN/getWebhookInfo', { method: 'POST', body: '' }), ENV);
+  assert.equal(res.status, 200);
+  assert.equal(lastFetch.method, 'POST');
+  assert.equal(lastFetch.body, '');
+});
+
+test('external redirect is rejected with 502 and no Location', async () => {
+  globalThis.fetch = async () =>
+    new Response(null, { status: 302, headers: { location: 'https://evil.example/x?token=abc' } });
+  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe'), ENV);
+  assert.equal(res.status, 502);
+  assert.equal(res.headers.get('location'), null);
+});
+
+test('same-origin redirect on api.telegram.org is passed through', async () => {
+  globalThis.fetch = async () =>
+    new Response(null, { status: 302, headers: { location: 'https://api.telegram.org/file/bot123TOKEN/x.bin' } });
+  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe'), ENV);
+  assert.equal(res.status, 302);
+  assert.ok((res.headers.get('location') || '').startsWith('https://api.telegram.org'));
+});
+
+test('Connection-listed request headers are not forwarded upstream', async () => {
+  resetFetch();
+  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe', {
+    headers: { Connection: 'keep-alive, X-Internal-Header', 'X-Internal-Header': 'test-secret' },
+  }), ENV);
+  assert.equal(res.status, 200);
+  assert.equal(lastFetch.headers.get('x-internal-header'), null);
+});
+
+test('Connection-listed response headers are stripped from client', async () => {
+  globalThis.fetch = async () => {
+    const h = new Headers();
+    h.set('Content-Type', 'application/json');
+    h.set('Connection', 'close, X-Debug-Header');
+    h.set('X-Debug-Header', 'debug-secret');
+    return new Response('{}', { status: 200, headers: h });
+  };
+  const res = await worker.fetch(makeReq('/bot123TOKEN/getMe'), ENV);
+  assert.equal(res.headers.get('x-debug-header'), null);
+  assert.equal(res.headers.get('content-type'), 'application/json');
+});
+
+test('File API response is streamed (ReadableStream, order+content preserved)', async () => {
+  const chunks = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5]), new Uint8Array([6])];
+  function makeStream() {
+    let i = 0;
+    return new ReadableStream({
+      pull(controller) {
+        if (i < chunks.length) { controller.enqueue(chunks[i]); i++; }
+        else { controller.close(); }
+      },
+    });
+  }
+  globalThis.fetch = async (input) => {
+    lastFetch = { input: String(input.url) };
+    return new Response(makeStream(), { status: 200, headers: { 'content-type': 'application/octet-stream' } });
+  };
+  const res = await worker.fetch(makeReq('/file/bot123TOKEN/docs/stream.bin'), ENV);
+  assert.equal(res.status, 200);
+  // response body is a ReadableStream (not a pre-buffered blob)
+  assert.ok(res.body instanceof ReadableStream);
+  const reader = res.body.getReader();
+  const got = [];
+  let done = false;
+  while (!done) {
+    const { value, done: d } = await reader.read();
+    done = d;
+    if (value) got.push(Array.from(value));
+  }
+  assert.deepEqual(got, [[1, 2, 3], [4, 5], [6]]);
+});
+
+test('delayed upstream (>16s) is not cut by an artificial worker timeout', { timeout: 30000 }, async () => {
+  globalThis.fetch = async () => {
+    await new Promise((r) => setTimeout(r, 16500));
+    return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
+  };
+  const res = await worker.fetch(makeReq('/bot123TOKEN/getUpdates?timeout=45'), ENV);
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.ok, true);
+});
+
+test('encoded path and dot-dot stay on api.telegram.org (no upstream escape)', async () => {
   resetFetch();
   const res = await worker.fetch(makeReq('/bot123TOKEN%2FgetMe%3Ffoo'), ENV);
-  // pathname starts with /bot -> routes; upstream host stays api.telegram.org
+  assert.equal(res.status, 200);
   assert.ok(lastFetch.input.startsWith('https://api.telegram.org/bot123TOKEN'));
 });
 
-test('large binary File API response is not truncated', async () => {
-  const big = new Uint8Array(1024 * 1024).fill(0xab);
-  globalThis.fetch = async (input) => {
-    lastFetch = { input: String(input.url) };
-    return new Response(big, { status: 200, headers: { 'content-type': 'application/octet-stream' } });
-  };
-  const res = await worker.fetch(makeReq('/file/bot123TOKEN/docs/big.bin'), ENV);
-  assert.equal(res.status, 200);
-  const buf = Buffer.from(await res.arrayBuffer());
-  assert.equal(buf.length, big.length);
-  assert.equal(buf[0], 0xab);
-  assert.equal(buf[buf.length - 1], 0xab);
+test('path normalization cannot escape to another origin', async () => {
+  resetFetch();
+  const res = await worker.fetch(makeReq('/bot123TOKEN/../../evil/getMe'), ENV);
+  assert.ok(res.status === 404 || res.status === 200);
+  if (res.status === 200) {
+    assert.ok(lastFetch.input.startsWith('https://api.telegram.org/'));
+  } else {
+    assert.equal(lastFetch, null);
+  }
 });

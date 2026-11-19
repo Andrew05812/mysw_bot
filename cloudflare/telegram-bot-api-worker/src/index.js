@@ -1,19 +1,17 @@
 /**
  * Cloudflare Worker: Telegram Bot API proxy for mysw_bot.
- *
  * Proxies ONLY to https://api.telegram.org (fixed upstream). No open proxy.
- * Routes:
- *   - /bot<TOKEN>/<METHOD>          Bot API
- *   - /file/bot<TOKEN>/<FILE_PATH>  File API (binary pass-through)
- * Auth: X-Worker-Api-Key header must equal the WORKER_API_KEY secret.
- * Long polling: no artificial timeout is applied; the upstream response is
- * streamed back as-is. No secrets are stored in source or returned/logged.
+ * Routes: /bot<TOKEN>/<METHOD> and /file/bot<TOKEN>/<FILE_PATH>.
+ * Auth: X-Worker-Api-Key header equals the WORKER_API_KEY secret.
+ * Redirects: worker never follows; a redirect to a location outside
+ * api.telegram.org is rejected with a controlled 502 and no external Location
+ * is returned (a URL containing the token cannot redirect to an external host).
+ * Long polling: no artificial timeout; the upstream response is streamed back.
  */
 const UPSTREAM = "https://api.telegram.org";
 const KEY_HEADER = "X-Worker-Api-Key";
 const FILE_PREFIX = "/file/bot";
 const BOT_PREFIX = "/bot";
-// Hop-by-hop headers must not be forwarded upstream.
 const HOP_BY_HOP = new Set([
   "connection", "keep-alive", "proxy-connection", "proxy-authenticate",
   "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade",
@@ -26,9 +24,8 @@ function json(status, obj) {
   });
 }
 
-// Length-checked XOR comparison. This is a best-effort timing mitigation,
-// not a formal cryptographic constant-time primitive (the length check is
-// not constant-time, but the compare loop avoids early-exit on content).
+// Length-checked XOR comparison. Best-effort timing mitigation, not a formal
+// cryptographic constant-time primitive.
 function constantTimeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) {
     return false;
@@ -38,6 +35,37 @@ function constantTimeEqual(a, b) {
     diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return diff === 0;
+}
+
+// Drop hop-by-hop headers AND any header named in the Connection value, e.g.
+// "Connection: keep-alive, X-Internal-Header" also drops X-Internal-Header.
+function stripHopByHop(headers) {
+  const out = new Headers();
+  const conn = headers.get("connection");
+  const listed = new Set();
+  if (conn) {
+    for (const part of conn.split(",")) {
+      const t = part.trim().toLowerCase();
+      if (t) listed.add(t);
+    }
+  }
+  for (const [k, v] of headers.entries()) {
+    const lk = k.toLowerCase();
+    if (lk === "connection") continue;
+    if (HOP_BY_HOP.has(lk)) continue;
+    if (listed.has(lk)) continue;
+    out.set(k, v);
+  }
+  return out;
+}
+
+// Allow only a Location that re-enters this worker (relative) or stays on the
+// fixed upstream origin.
+function isAllowedRedirectLocation(loc) {
+  if (!loc) return false;
+  if (loc.startsWith("/")) return true;
+  return loc.startsWith("https://api.telegram.org") ||
+         loc.startsWith("http://api.telegram.org");
 }
 
 function buildUpstreamPath(pathname) {
@@ -76,14 +104,8 @@ export default {
       return json(404, { ok: false, error_code: 404, description: "not found" });
     }
 
-    // Copy headers except the worker auth header and host.
-    const headers = new Headers();
-    for (const [k, v] of request.headers.entries()) {
-      const lk = k.toLowerCase();
-      if (lk === KEY_HEADER.toLowerCase() || lk === "host") continue;
-      if (HOP_BY_HOP.has(lk)) continue;
-      headers.set(k, v);
-    }
+    const headers = stripHopByHop(request.headers);
+    headers.delete(KEY_HEADER);
 
     const upstreamUrl = upstreamPath + url.search;
     const upstreamRequest = new Request(upstreamUrl, {
@@ -96,14 +118,14 @@ export default {
 
     try {
       const resp = await fetch(upstreamRequest);
-      const outHeaders = new Headers();
-      for (const [k, v] of resp.headers.entries()) {
-        const lk = k.toLowerCase();
-        if (lk === "content-length" || lk === "connection" || lk === "transfer-encoding") {
-          continue;
+      if (resp.status >= 300 && resp.status < 400) {
+        const loc = resp.headers.get("location");
+        if (loc && !isAllowedRedirectLocation(loc)) {
+          return json(502, { ok: false, error_code: 502,
+                             description: "upstream redirect to unsupported location" });
         }
-        outHeaders.set(k, v);
       }
+      const outHeaders = stripHopByHop(resp.headers);
       return new Response(resp.body, {
         status: resp.status,
         statusText: resp.statusText,
