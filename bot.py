@@ -976,6 +976,8 @@ def tgv_menu_kb():
          InlineKeyboardButton("🗂 Категории", callback_data="tgv_cats")],
         [InlineKeyboardButton("📜 Журнал", callback_data="tgv_log")],
         [InlineKeyboardButton("⏳ Очередь", callback_data="tgv_queue")],
+        [InlineKeyboardButton("📋 История", callback_data="tgv_hist_all"),
+         InlineKeyboardButton("📊 Мониторинг", callback_data="tgv_monitor")],
         [InlineKeyboardButton("💾 Резервные копии", callback_data="tgv_backups")],
         [InlineKeyboardButton("🔌 MTProxy", callback_data="tgv_mtproxy")],
         [InlineKeyboardButton("🛠 Управление службой", callback_data="tgv_svc")],
@@ -1006,6 +1008,70 @@ def tgv_queue_set_paused(paused: bool):
           "c.execute(\"INSERT INTO settings(key,value) VALUES('queue_paused',?) "
           "ON CONFLICT(key) DO UPDATE SET value=excluded.value\", ('%s',));c.commit()" % v)
     host_run(f"python3 -c {shlex.quote(py)}", timeout=15)
+
+
+def tgv_history_text(mode: str = "all") -> str:
+    where = {"err": " WHERE etype IN ('video.delivery_failed','video.dead_letter','telegram.error','video.filtered') ",
+             "ok": " WHERE etype IN ('video.delivered') ",
+             "sys": " WHERE etype IN ('system.start','system.stop','queue.recovered','backup.created') "}.get(mode, " ")
+    py = (
+        "import sqlite3,json;c=sqlite3.connect('/home/adelf/projects/tg-video/data/data.db');"
+        "c.row_factory=sqlite3.Row;"
+        "print(json.dumps([dict(r) for r in c.execute("
+        f"'SELECT ts,etype,source_title,status,error,detail FROM events{where}"
+        "ORDER BY id DESC LIMIT 10')]))"
+    )
+    data = host_run_json(f"python3 -c {shlex.quote(py)}", timeout=20)
+    rows = data if isinstance(data, list) else []
+    title = {"err": "\u043e\u0448\u0438\u0431\u043a\u0438", "ok": "\u0434\u043e\u0441\u0442\u0430\u0432\u043a\u0438",
+             "sys": "\u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0435"}.get(mode, "\u0441\u043e\u0431\u044b\u0442\u0438\u044f")
+    if not rows:
+        return "\U0001F4CB *TG-VIDEO \u2014 \u0438\u0441\u0442\u043e\u0440\u0438\u044f (" + title + ")*\n\n\u041d\u0435\u0442 \u0437\u0430\u043f\u0438\u0441\u0435\u0439."
+    text = "\U0001F4CB *TG-VIDEO \u2014 \u0438\u0441\u0442\u043e\u0440\u0438\u044f (" + title + ")*\n\n"
+    for r in rows:
+        import time as _t
+        ts = _t.strftime('%d.%m %H:%M', _t.localtime(r.get('ts', 0)))
+        name = (r.get('source_title') or r.get('source_id') or '?')
+        text += "\u2022 `" + ts + "` `" + str(r.get('etype')) + "` \u2014 " + str(name) + "\n"
+        if r.get('error'):
+            text += "  \u274c " + str(r.get('error'))[:80] + "\n"
+        if r.get('detail'):
+            text += "  \u2139 " + str(r.get('detail'))[:60] + "\n"
+    return text
+
+
+def tgv_history_kb():
+    return [
+        [InlineKeyboardButton("\U0001F4CB \u0412\u0441\u0435", callback_data="tgv_hist_all"),
+         InlineKeyboardButton("\u274c \u041e\u0448\u0438\u0431\u043a\u0438", callback_data="tgv_hist_err"),
+         InlineKeyboardButton("\u2705 \u0414\u043e\u0441\u0442\u0430\u0432\u043a\u0438", callback_data="tgv_hist_ok")],
+        [InlineKeyboardButton("\U0001F504 \u0421\u0438\u0441\u0442\u0435\u043c\u0430", callback_data="tgv_hist_sys")],
+        [InlineKeyboardButton("\u25c0\ufe0f \u041d\u0430\u0437\u0430\u0434", callback_data="tgv_menu")],
+    ]
+
+
+def tgv_monitor_text() -> str:
+    py = (
+        "import sqlite3,json,time;c=sqlite3.connect('/home/adelf/projects/tg-video/data/data.db');"
+        "c.row_factory=sqlite3.Row;"
+        "q={r['status']:r['n'] for r in c.execute('SELECT status,COUNT(*) n FROM queue GROUP BY status')};"
+        "e=c.execute('SELECT COUNT(*) n FROM events WHERE ts>?',(time.time()-86400,)).fetchone()['n'];"
+        "print(json.dumps({'queue':q,'events24':e}))"
+    )
+    data = host_run_json(f"python3 -c {shlex.quote(py)}", timeout=20)
+    q = (data or {}).get("queue") or {}
+    e24 = (data or {}).get("events24") or "?"
+    def n(k):
+        return q.get(k, 0)
+    return (
+        "\U0001F4CA *TG-VIDEO \u2014 \u043c\u043e\u043d\u0438\u0442\u043e\u0440\u0438\u043d\u0433*\n\n"
+        f"\u23f3 \u0412 \u043e\u0447\u0435\u0440\u0435\u0434\u0438: `{n('pending')}`\n"
+        f"\u2699 \u041e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0430: `{n('processing')}` \u00b7 \u043e\u0442\u043f\u0440\u0430\u0432\u043a\u0430 `{n('sending')}`\n"
+        f"\u2753 \u0414\u043e\u0441\u0442\u0430\u0432\u043a\u0430?: `{n('delivery_unknown')}`\n"
+        f"\u2705 \u0423\u0441\u043f\u0435\u0448\u043d\u043e: `{n('succeeded')}` \u00b7 dead-letter `{n('dead_letter')}`\n"
+        f"\U0001F4C5 \u0421\u043e\u0431\u044b\u0442\u0438\u0439 \u0437\u0430 24\u0447: `{e24}`\n\n"
+        "\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u043e \u043f\u043e \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0430\u043c \u2014 \u0432 Mini App."
+    )
 
 
 def tgv_query_health() -> dict:
@@ -3018,6 +3084,18 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(tgv_queue_set_paused, False)
                 await q.answer("▶️ Очередь продолжена", show_alert=True)
                 await edit(await asyncio.to_thread(tgv_queue_text), tgv_queue_kb())
+            elif d == "tgv_hist_all":
+                await edit(await asyncio.to_thread(tgv_history_text, "all"), tgv_history_kb())
+            elif d == "tgv_hist_err":
+                await edit(await asyncio.to_thread(tgv_history_text, "err"), tgv_history_kb())
+            elif d == "tgv_hist_ok":
+                await edit(await asyncio.to_thread(tgv_history_text, "ok"), tgv_history_kb())
+            elif d == "tgv_hist_sys":
+                await edit(await asyncio.to_thread(tgv_history_text, "sys"), tgv_history_kb())
+            elif d == "tgv_monitor":
+                await edit(await asyncio.to_thread(tgv_monitor_text),
+                           [[InlineKeyboardButton("🔄 Обновить", callback_data="tgv_monitor"),
+                             InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")]])
             elif d == "tgv_src":
                 await edit(await asyncio.to_thread(tgv_sources_text),
                            [[InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")]])
