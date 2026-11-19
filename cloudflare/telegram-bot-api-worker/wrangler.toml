@@ -1,0 +1,12 @@
+# Cloudflare Worker: Telegram Bot API proxy (tg-bot-api-proxy)
+# Deploy via Cloudflare Dashboard (paste src/index.js) or wrangler.
+# No secrets are stored here. Set the WORKER_API_KEY secret in the Dashboard
+# (Settings -> Variables and Secrets) to the same value as mybot WORKER_API_KEY.
+
+name = "tg-bot-api-proxy"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+workers_dev = true
+
+# The route binding is configured in the Cloudflare Dashboard; do not add a
+# custom domain here unless the account has one mapped to this worker.
