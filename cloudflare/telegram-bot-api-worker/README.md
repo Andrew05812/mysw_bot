@@ -18,8 +18,9 @@ Bot API path for `mysw_bot` (direct `api.telegram.org` is blocked on the server)
 - Fixed upstream `https://api.telegram.org`; never an open proxy.
 - Only `GET` and `POST`; `OPTIONS` returns 204.
 - Query params, POST body, headers and binary File API bodies pass through.
-- Auth is checked with a constant-time comparison; the auth header is **not**
-  forwarded to Telegram.
+- Auth is checked with a length-checked XOR comparison (best-effort timing
+  mitigation, not a formal cryptographic constant-time primitive); the auth
+  header is **not** forwarded to Telegram.
 - Long polling: no artificial Worker fetch timeout; the upstream response is
   streamed back as-is (Telegram `getUpdates?timeout=N` is preserved).
 - On upstream failure a controlled JSON `502` is returned; no secrets leak.
@@ -63,8 +64,22 @@ After the worker returns 200 for `getMe`, restart mybot:
 
 ## Long polling and platform limits
 
-Cloudflare Workers free plan caps request wall-clock duration (approx. 30 s),
-so a `getUpdates?timeout=` larger than that would be cut by the platform, not by
-this worker. On the paid plan (15 min) long polling is fully supported. Keep the
-bot `getUpdates` timeout consistent with the plan; do not raise it above the
-platform limit.
+This worker applies **no artificial timeout**: `getUpdates?timeout=N` is
+forwarded to Telegram unchanged and the response is streamed back as-is.
+
+Cloudflare Workers does not impose a hard wall-clock limit on an incoming HTTP
+request while the client stays connected (see
+https://developers.cloudflare.com/workers/platform/limits/). The Free plan
+caps *CPU time* (10 ms) but waiting on a network `fetch` is not active CPU
+execution, and a response body that continues streaming keeps the worker alive.
+So long polling works on the Free plan for typical Telegram `getUpdates` waits;
+no paid plan is required for this.
+
+Remaining real constraints are on the client and network, not the worker:
+- the bot's HTTP read timeout must exceed Telegram's requested `getUpdates`
+  `timeout` (so the client does not close the connection first);
+- Telegram Bot API and any intermediary network components have their own
+  idle/timeout behaviour.
+
+No claim is made that connections run forever or that every client tolerates
+arbitrarily long responses.

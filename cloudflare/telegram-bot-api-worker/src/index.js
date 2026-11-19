@@ -13,6 +13,11 @@ const UPSTREAM = "https://api.telegram.org";
 const KEY_HEADER = "X-Worker-Api-Key";
 const FILE_PREFIX = "/file/bot";
 const BOT_PREFIX = "/bot";
+// Hop-by-hop headers must not be forwarded upstream.
+const HOP_BY_HOP = new Set([
+  "connection", "keep-alive", "proxy-connection", "proxy-authenticate",
+  "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade",
+]);
 
 function json(status, obj) {
   return new Response(JSON.stringify(obj), {
@@ -21,6 +26,9 @@ function json(status, obj) {
   });
 }
 
+// Length-checked XOR comparison. This is a best-effort timing mitigation,
+// not a formal cryptographic constant-time primitive (the length check is
+// not constant-time, but the compare loop avoids early-exit on content).
 function constantTimeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) {
     return false;
@@ -73,6 +81,7 @@ export default {
     for (const [k, v] of request.headers.entries()) {
       const lk = k.toLowerCase();
       if (lk === KEY_HEADER.toLowerCase() || lk === "host") continue;
+      if (HOP_BY_HOP.has(lk)) continue;
       headers.set(k, v);
     }
 
