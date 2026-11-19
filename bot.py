@@ -975,6 +975,7 @@ def tgv_menu_kb():
         [InlineKeyboardButton("📂 Источники", callback_data="tgv_src"),
          InlineKeyboardButton("🗂 Категории", callback_data="tgv_cats")],
         [InlineKeyboardButton("📜 Журнал", callback_data="tgv_log")],
+        [InlineKeyboardButton("⏳ Очередь", callback_data="tgv_queue")],
         [InlineKeyboardButton("💾 Резервные копии", callback_data="tgv_backups")],
         [InlineKeyboardButton("🔌 MTProxy", callback_data="tgv_mtproxy")],
         [InlineKeyboardButton("🛠 Управление службой", callback_data="tgv_svc")],
@@ -987,8 +988,24 @@ def tgv_svc_kb():
         [InlineKeyboardButton("▶️ Старт", callback_data="tgv_svc_start"),
          InlineKeyboardButton("⏹ Стоп", callback_data="tgv_svc_stop")],
         [InlineKeyboardButton("🔄 Рестарт", callback_data="tgv_svc_restart")],
+[InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")],
+    ]
+
+
+def tgv_queue_kb():
+    return [
+        [InlineKeyboardButton("⏸ Пауза", callback_data="tgv_queue_pause"),
+         InlineKeyboardButton("▶️ Продолжить", callback_data="tgv_queue_resume")],
         [InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")],
     ]
+
+
+def tgv_queue_set_paused(paused: bool):
+    v = "1" if paused else "0"
+    py = ("import sqlite3;c=sqlite3.connect('/home/adelf/projects/tg-video/data/data.db');"
+          "c.execute(\"INSERT INTO settings(key,value) VALUES('queue_paused',?) "
+          "ON CONFLICT(key) DO UPDATE SET value=excluded.value\", ('%s',));c.commit()" % v)
+    host_run(f"python3 -c {shlex.quote(py)}", timeout=15)
 
 
 def tgv_query_health() -> dict:
@@ -1006,6 +1023,35 @@ def tgv_query_health() -> dict:
     tg = data.get("telegram_connected")
     return {"api": api, "telegram": bool(tg) if tg is not None else None,
             "status": data.get("status")}
+
+def tgv_queue_text() -> str:
+    py = (
+        "import sqlite3,json;c=sqlite3.connect('/home/adelf/projects/tg-video/data/data.db');"
+        "c.row_factory=sqlite3.Row;"
+        "counts={r['status']:r['n'] for r in c.execute('SELECT status,COUNT(*) n FROM queue GROUP BY status')};"
+        "paused=c.execute(\"SELECT value FROM settings WHERE key='queue_paused'\").fetchone();"
+        "print(json.dumps({'counts':counts,'paused':bool(paused and paused['value']=='1')}))"
+    )
+    data = host_run_json(f"python3 -c {shlex.quote(py)}", timeout=20)
+    counts = (data or {}).get("counts") or {}
+    paused = bool((data or {}).get("paused"))
+    def nn(k):
+        return counts.get(k, 0)
+    p = "\u23f8\ufe0f" if paused else "\u25b6\ufe0f"
+    stat = "\u043f\u0430\u0443\u0437\u0430" if paused else "\u0430\u043a\u0442\u0438\u0432\u043d\u0430"
+    return (
+        "\U0001F3AC *TG-VIDEO \u2014 \u043e\u0447\u0435\u0440\u0435\u0434\u044c*\n\n"
+        f"{p} \u041e\u0447\u0435\u0440\u0435\u0434\u044c: `{stat}`\n"
+        f"\u23f3 \u041e\u0436\u0438\u0434\u0430\u044e\u0442: `{nn('pending')}`\n"
+        f"\u2699\ufe0f \u0412 \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0435: `{nn('processing')}`\n"
+        f"\U0001F4E4 \u041e\u0442\u043f\u0440\u0430\u0432\u043a\u0430: `{nn('sending')}`\n"
+        f"\U0001F501 \u041f\u043e\u0432\u0442\u043e\u0440\u044b: `{nn('retry_wait')}`\n"
+        f"\u2753 \u041d\u0435\u043e\u043f\u0440\u0435\u0434.: `{nn('delivery_unknown')}`\n"
+        f"\u2705 \u0423\u0441\u043f\u0435\u0448\u043d\u043e: `{nn('succeeded')}`\n"
+        f"\u274c Dead-letter: `{nn('dead_letter')}`\n\n"
+        "\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u043e \u2014 \u0432 Mini App."
+    )
+
 
 
 def tgv_status_text() -> str:
@@ -2962,6 +3008,16 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await edit(await asyncio.to_thread(tgv_status_text),
                            [[InlineKeyboardButton("🔄 Обновить", callback_data="tgv_status"),
                              InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")]])
+            elif d == "tgv_queue":
+                await edit(await asyncio.to_thread(tgv_queue_text), tgv_queue_kb())
+            elif d == "tgv_queue_pause":
+                await asyncio.to_thread(tgv_queue_set_paused, True)
+                await q.answer("⏸ Очередь поставлена на паузу", show_alert=True)
+                await edit(await asyncio.to_thread(tgv_queue_text), tgv_queue_kb())
+            elif d == "tgv_queue_resume":
+                await asyncio.to_thread(tgv_queue_set_paused, False)
+                await q.answer("▶️ Очередь продолжена", show_alert=True)
+                await edit(await asyncio.to_thread(tgv_queue_text), tgv_queue_kb())
             elif d == "tgv_src":
                 await edit(await asyncio.to_thread(tgv_sources_text),
                            [[InlineKeyboardButton("◀️ Назад", callback_data="tgv_menu")]])
