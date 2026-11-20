@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  python-tests:
+    name: Python tests (pytest)
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: "123:CI_FAKE_TOKEN"
+      BOT_ACCESS_PASSWORD: "ci-test-password"
+      ADMIN_IDS: ""
+      WORKER_API_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      SSH_KEY_PATH: "/tmp/ci-ssh-key"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/requirements.txt
+      - name: Compile checks
+        run: python -m compileall -q bot.py tests
+      - name: Run tests
+        run: python -m pytest tests -q
+        env:
+          PYTHONPATH: .
+
+  worker-tests:
+    name: Cloudflare Worker tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloudflare/telegram-bot-api-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Worker syntax check
+        run: node --check src/index.js
+      - name: Worker tests
+        run: node --test src/index.test.mjs
