@@ -62,3 +62,39 @@ not a substitute.
    Cloudflare, update the protected env, restart only `mybot`, and re-verify
    `getMe` / a test command.
 4. Do not echo secrets in any report, issue or commit.
+
+
+## Login hardening (3.3.8)
+
+- Password login is rate limited per Telegram user id: 5 failed attempts then a
+  15-minute block (AUTH_MAX_ATTEMPTS, AUTH_BLOCK_SECONDS).
+- Authenticated sessions expire after AUTH_SESSION_TTL_SECONDS (default 8h);
+  user_is_admin drops an expired session. Re-login restores it; logout clears
+  session, attempts and block state.
+- The password message is best-effort deleted; if deletion fails the user is
+  told to remove it manually. The password is never logged or echoed.
+- ADMIN_IDS (when non-empty) restricts admin access; when empty, any
+  authenticated user is treated as admin (documented legacy policy).
+
+## Dangerous command confirmation
+
+- classify_dangerous() flags potentially destructive terminal commands
+  (recursive deletes, filesystem formatting/writes, host power control, service
+  stops, container removal, compose teardown). Flagged commands are routed to
+  password confirmation (risk_pending action shell_dangerous); they are not
+  executed until the operator re-enters the access password.
+- Confirmation is bound to the pending command; a forged callback cannot bypass
+  it, and an incorrect password cancels it.
+
+## Shell execution and secret safety
+
+- run_shell_command executes on the GMKtec host over SSH and NEVER falls back
+  to running the command inside the container. On SSH error, timeout or
+  permission denial it returns a safe diagnostic without local execution.
+- redact_sensitive_data() is applied centrally in append_audit and when showing
+  commands, removing bot tokens, passwords, API keys, Authorization / Bearer /
+  X-Worker-Api-Key values, /bot<TOKEN>/ URLs and password=/token= arguments
+  before persistence or display.
+- md_inline() sanitizes command text for Telegram Markdown inline spans
+  (backticks/newlines removed, length-capped); command output is shown in a
+  code block with triple backticks neutralized by sanitize_codeblock.

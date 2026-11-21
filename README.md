@@ -57,3 +57,14 @@ node --test src/index.test.mjs
 ```
 
 CI runs all of the above on push/PR (`.github/workflows/ci.yml`).
+
+## Security (3.3.8)
+
+- Password login is rate limited (5 attempts / 15 min block) and sessions expire
+  after `AUTH_SESSION_TTL_SECONDS` (default 8 h).
+- `run_shell_command` runs host commands over SSH and never falls back to the
+  container; SSH errors return a safe diagnostic.
+- `redact_sensitive_data()` removes tokens/passwords/API keys from the audit
+  log and user-visible text; `classify_dangerous()` routes destructive commands
+  through password confirmation.
+- See `docs/SECURITY.md`.

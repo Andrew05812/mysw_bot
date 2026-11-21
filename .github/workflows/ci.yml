@@ -31,6 +31,15 @@ jobs:
         run: python -m pytest tests -q
         env:
           PYTHONPATH: .
+      - name: No real secrets committed
+        run: |
+          if grep -rniE "TELEGRAM_BOT_TOKEN\s*=\s*[0-9]+:[A-Za-z0-9_-]{20,}" --include='*.py' --include='*.md' --include='*.yml' . | grep -viE "CI_FAKE|ci-|test-|123:FAKE"; then
+            echo "suspicious token-like literal found"; exit 1
+          fi
+          if grep -rniE "BEGIN (RSA|OPENSSH|EC) PRIVATE KEY" --include='*.py' --include='*.md' --include='*.yml' .; then
+            echo "private key material found"; exit 1
+          fi
+          echo "no real secrets detected"
 
   worker-tests:
     name: Cloudflare Worker tests
