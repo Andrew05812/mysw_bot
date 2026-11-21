@@ -6,6 +6,7 @@ SSH_KEY_PATH = os.environ.get(
 )
 import json
 import hashlib
+import re
 import shlex
 import subprocess
 import time
@@ -81,15 +82,31 @@ if ADMIN_IDS and ADMIN_ID is None:
 
 AUTHENTICATED_USERS = set()
 
+AUTH_MAX_ATTEMPTS = 5
+AUTH_BLOCK_SECONDS = 900
+AUTH_SESSION_TTL_SECONDS = int(os.getenv("AUTH_SESSION_TTL_SECONDS", "28800"))
+_AUTH_ATTEMPTS = {}
+_AUTH_BLOCK_UNTIL = {}
+_AUTH_SESSIONS = {}
+
+
+# Legacy policy: empty ADMIN_IDS => any authenticated user is admin (default on).
+ALLOW_ANY_AUTHENTICATED_ADMIN = os.getenv("ALLOW_ANY_AUTHENTICATED_ADMIN", "1").strip().lower() not in ("0", "false", "no", "off")
+
 def user_is_admin(user_id):
     if user_id is None:
+        return False
+    now = time.monotonic()
+    exp = _AUTH_SESSIONS.get(user_id)
+    if exp is not None and now > exp:
+        AUTHENTICATED_USERS.discard(user_id)
+        _AUTH_SESSIONS.pop(user_id, None)
         return False
     if user_id not in AUTHENTICATED_USERS:
         return False
     if ADMIN_IDS:
         return user_id in ADMIN_IDS
-    # Если ADMIN_IDS не задан — доступ всем, кто прошел пароль.
-    return True
+    return ALLOW_ANY_AUTHENTICATED_ADMIN
 
 SERVICES = ["docker", "cloudflared", "xray", "noip2", "fail2ban", "tor@default", "ssh", "ufw"]
 
@@ -300,7 +317,7 @@ def append_audit(user_id: int | None, action: str, status: str = "ok", details: 
         "user_id": user_id,
         "action": action,
         "status": status,
-        "details": (details or "")[:4000],
+        "details": redact_sensitive_data(details or "")[:4000],
     }
     try:
         with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
@@ -692,6 +709,34 @@ def truncate_long_output(text: str, max_total: int = 3500, head_chars: int = 150
         tail_chars = 0
     return text[:head_chars] + "\n...\n" + (text[-tail_chars:] if tail_chars else "")
 
+def redact_sensitive_data(value):
+    """Remove secrets from a string before it is persisted or shown.
+
+    Uses env secrets and common token/password/API-key patterns. This is a
+    best-effort central guard; callers should still avoid passing secrets.
+    """
+    if not value:
+        return value
+    text = str(value)
+    for name in ("TELEGRAM_BOT_TOKEN", "BOT_ACCESS_PASSWORD", "WORKER_API_KEY"):
+        secret = os.getenv(name, "")
+        if secret and secret in text:
+            text = text.replace(secret, "[" + name + "]")
+    text = re.sub(r"(/bot)[A-Za-z0-9:_-]{10,}(/[A-Za-z0-9_]+)", r"\1[TOKEN]\2", text)
+    text = re.sub(r"(?i)(authorization|proxy-authorization|x-worker-api-key)\s*[:=]\s*\S+", r"\1: [REDACTED]", text)
+    text = re.sub(r"(?i)(bearer\s+)\S+", r"\1[TOKEN]", text)
+    text = re.sub(r"(?i)((?:password|api[-_]?key|token|secret)\s*[:=]\s*)\S+", r"\1[REDACTED]", text)
+    return text
+
+
+def md_inline(value):
+    """Render a value safely inside an inline code span (Markdown)."""
+    if not value:
+        return ""
+    s = str(value).replace("`", "'").replace("\n", " ")
+    return s[:200]
+
+
 def run_shell_command(command: str, timeout: int = 30):
     # По умолчанию выполняем команды на хосте через SSH,
     # чтобы бот управлял “вне контейнера”.
@@ -704,13 +749,16 @@ def run_shell_command(command: str, timeout: int = 30):
             emoji = "❌"
         return emoji, output
 
-    # Фолбэк: выполнить локально внутри контейнера.
-    result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
-    output = result.stdout or result.stderr or "✅ Нет вывода"
-    output = sanitize_codeblock(output)
-    output = truncate_long_output(output, max_total=3500, head_chars=1500, tail_chars=1700)
-    emoji = "✅" if result.returncode == 0 else "❌"
-    return emoji, output
+    # SAFETY: never fall back to running a host command inside the container.
+    # A failed/refused SSH session must not silently execute the same command
+    # in the wrong environment. Return a clear, non-revealing diagnostic.
+    if host_out.startswith("⏰"):
+        return "❌", sanitize_codeblock("SSH timeout: команда не выполнена на хосте")
+    if host_out.lower().startswith("permission denied"):
+        return "❌", sanitize_codeblock("SSH: permission denied на хосте")
+    err = host_out[2:].strip() if host_out.startswith("❌") else (host_out or "unknown error")
+    err = sanitize_codeblock(err)
+    return "❌", truncate_long_output(f"SSH не выполнил команду: {err}", max_total=1000, head_chars=500, tail_chars=400)
 
 def get_system_stats():
     metrics = host_collect_system_metrics(interval_seconds=1.0)
@@ -2119,6 +2167,9 @@ async def terminal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def logout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     AUTHENTICATED_USERS.discard(uid)
+    _AUTH_SESSIONS.pop(uid, None)
+    _AUTH_ATTEMPTS.pop(uid, None)
+    _AUTH_BLOCK_UNTIL.pop(uid, None)
     context.user_data.clear()
     append_audit(uid, "logout", "ok")
     await update.message.reply_text("🔒 Вы вышли из аккаунта. Для входа снова нажмите /start.")
@@ -2179,22 +2230,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Шаг аутентификации паролем.
     if context.user_data.get("awaiting_password"):
+        if _AUTH_BLOCK_UNTIL.get(uid, 0) > time.monotonic():
+            await update.message.reply_text("⏳ Вход временно заблокирован из-за слишком многих попыток. Попробуйте позже.")
+            return
         try:
             await update.message.delete()
         except Exception:
-            pass
+            await update.message.reply_text("⚠️ Не удалось удалить сообщение с паролем. Удалите его вручную.")
         if text == ACCESS_PASSWORD:
             AUTHENTICATED_USERS.add(uid)
             context.user_data["awaiting_password"] = False
             context.user_data["shell_mode"] = False
+            _AUTH_SESSIONS[uid] = time.monotonic() + AUTH_SESSION_TTL_SECONDS
+            _AUTH_ATTEMPTS.pop(uid, None)
+            _AUTH_BLOCK_UNTIL.pop(uid, None)
             append_audit(uid, "login", "ok")
             await update.message.reply_text(
                 "✅ Вход выполнен.",
                 reply_markup=main_kb(),
             )
         else:
-            append_audit(uid, "login", "fail", "bad password")
-            await update.message.reply_text("❌ Неверный пароль. Попробуйте ещё раз.")
+            _AUTH_ATTEMPTS[uid] = _AUTH_ATTEMPTS.get(uid, 0) + 1
+            if _AUTH_ATTEMPTS[uid] >= AUTH_MAX_ATTEMPTS:
+                _AUTH_BLOCK_UNTIL[uid] = time.monotonic() + AUTH_BLOCK_SECONDS
+                _AUTH_ATTEMPTS.pop(uid, None)
+                append_audit(uid, "login", "fail", "blocked")
+                await update.message.reply_text("⏳ Слишком много неверных попыток. Вход заблокирован на 15 минут.")
+            else:
+                append_audit(uid, "login", "fail", "bad password")
+                await update.message.reply_text("❌ Неверный пароль. Попробуйте ещё раз.")
         return
 
     if not user_is_admin(uid):
@@ -2221,6 +2285,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "🔐 Выйти из аккаунта":
         AUTHENTICATED_USERS.discard(uid)
+        _AUTH_SESSIONS.pop(uid, None)
+        _AUTH_ATTEMPTS.pop(uid, None)
+        _AUTH_BLOCK_UNTIL.pop(uid, None)
         context.user_data.clear()
         append_audit(uid, "logout", "ok")
         await update.message.reply_text("🔒 Вы вышли из аккаунта. Для входа снова нажмите /start.")
@@ -2239,6 +2306,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("risk_pending", None)
             return
         action = risk.get("action")
+        cmd = risk.get("command")
         context.user_data.pop("risk_pending", None)
         append_audit(uid, "risk_confirm", "ok", f"action={action}")
         if action == "reboot_yes":
@@ -2267,6 +2335,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
             append_audit(uid, "updates_full_upgrade", "ok", f"remaining={remaining_count}")
+            return
+        if action == "shell_dangerous":
+            if cmd is None:
+                return
+            emoji, output = await asyncio.to_thread(run_shell_command, cmd, timeout=30)
+            append_audit(uid, "shell", "ok" if emoji == "✅" else "fail", cmd)
+            await update.message.reply_text(
+                f"{emoji} `$ {md_inline(redact_sensitive_data(cmd))}`\n```\n{output}\n```",
+                parse_mode="Markdown",
+            )
             return
         if action == "fs_del_yes":
             tpath = context.user_data.get("fs_delete_target")
@@ -2649,22 +2727,43 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Используй кнопки меню 👇", reply_markup=main_kb())
 
+_DANGEROUS_PATTERNS = [
+    r"\brm\s+-[a-z]*r[fF]\b", r"\bmkfs", r"\bdd\b",
+    r"\bshutdown\b", r"\breboot\b", r"\bpoweroff\b",
+    r"\bsystemctl\s+stop\b", r"\bdocker\s+rm\b",
+    r"\bdocker\s+compose\s+down\b", r"\brm\s+-fr\b",
+]
+
+
+def classify_dangerous(command):
+    c = re.sub(r"\s+", " ", (command or "").strip().lower())
+    if not c:
+        return False
+    return any(re.search(p, c) for p in _DANGEROUS_PATTERNS)
+
+
 async def run_shell(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str):
     global command_history
     if not user_is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Доступ запрещен.")
+        return
+    if classify_dangerous(command):
+        context.user_data["risk_pending"] = {"action": "shell_dangerous", "command": command}
+        await update.message.reply_text(
+            "⚠️ Команда распознана как потенциально опасная. Подтвердите паролем доступа.")
         return
     command_history.append({'cmd': command, 'time': datetime.now().strftime('%H:%M:%S')})
     if len(command_history) > 20:
         command_history = command_history[-20:]
 
     context.user_data["last_shell_cmd"] = command
-    msg = await update.message.reply_text(f"⚙️ `{command}`...", parse_mode="Markdown")
+    cmd_disp = md_inline(redact_sensitive_data(command))
+    msg = await update.message.reply_text(f"⚙️ `{cmd_disp}`...", parse_mode="Markdown")
     try:
         emoji, output = await asyncio.to_thread(run_shell_command, command, timeout=30)
         append_audit(update.effective_user.id, "shell", "ok" if emoji == "✅" else "fail", command)
         await msg.edit_text(
-            f"{emoji} `$ {command}`\n```\n{output}\n```",
+            f"{emoji} `$ {cmd_disp}`\n```\n{output}\n```",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔁 Повторить", callback_data="rep_last_shell")
