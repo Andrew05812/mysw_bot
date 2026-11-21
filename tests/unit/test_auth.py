@@ -41,3 +41,44 @@ def test_admin_ids_parse_digit_only():
         if part.isdigit():
             ids.add(int(part))
     assert ids == {100, 200, 300}
+
+
+def test_session_expires(monkeypatch):
+    import time as _t
+    bot.AUTHENTICATED_USERS.add(1)
+    bot._AUTH_SESSIONS[1] = _t.monotonic() - 1  # expired
+    assert bot.user_is_admin(1) is False
+    assert 1 not in bot.AUTHENTICATED_USERS
+
+
+def test_session_valid(monkeypatch):
+    import time as _t
+    bot.AUTHENTICATED_USERS.add(2)
+    bot._AUTH_SESSIONS[2] = _t.monotonic() + 3600
+    monkeypatch.setattr(bot, "ADMIN_IDS", set())
+    assert bot.user_is_admin(2) is True
+
+
+def test_allow_any_authenticated_default_on(monkeypatch):
+    monkeypatch.setattr(bot, "AUTHENTICATED_USERS", {7})
+    monkeypatch.setattr(bot, "ADMIN_IDS", set())
+    monkeypatch.setattr(bot, "_AUTH_SESSIONS", {})
+    monkeypatch.setattr(bot, "ALLOW_ANY_AUTHENTICATED_ADMIN", True)
+    assert bot.user_is_admin(7) is True
+
+
+def test_allow_any_authenticated_off_denies(monkeypatch):
+    monkeypatch.setattr(bot, "AUTHENTICATED_USERS", {7})
+    monkeypatch.setattr(bot, "ADMIN_IDS", set())
+    monkeypatch.setattr(bot, "_AUTH_SESSIONS", {})
+    monkeypatch.setattr(bot, "ALLOW_ANY_AUTHENTICATED_ADMIN", False)
+    assert bot.user_is_admin(7) is False
+
+
+def test_admin_ids_still_work_when_flag_off(monkeypatch):
+    monkeypatch.setattr(bot, "AUTHENTICATED_USERS", {1, 2})
+    monkeypatch.setattr(bot, "ADMIN_IDS", {1})
+    monkeypatch.setattr(bot, "_AUTH_SESSIONS", {})
+    monkeypatch.setattr(bot, "ALLOW_ANY_AUTHENTICATED_ADMIN", False)
+    assert bot.user_is_admin(1) is True
+    assert bot.user_is_admin(2) is False
