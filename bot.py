@@ -1096,6 +1096,23 @@ def tgv_queue_set_paused(paused: bool):
     host_run(f"python3 -c {shlex.quote(py)}", timeout=15)
 
 
+TGV_EVENT_LABELS = {
+    "video.enqueued": ("📥", "в очередь"),
+    "video.processed": ("🎞", "обработано"),
+    "video.delivered": ("✅", "отправлено"),
+    "video.delivery_failed": ("⚠️", "ошибка отправки"),
+    "video.dead_letter": ("🛑", "не доставлено"),
+    "video.filtered": ("🧹", "отфильтровано"),
+    "video.duplicate": ("♻️", "дубликат"),
+    "telegram.error": ("🔻", "ошибка Telegram"),
+    "system.start": ("🚀", "запуск"),
+    "system.stop": ("🛑", "остановка"),
+    "queue.recovered": ("🛠", "очередь восстановлена"),
+    "backup.created": ("💾", "создан бэкап"),
+}
+TGV_DETAIL_LABELS = {"created": "создано"}
+
+
 def tgv_history_text(mode: str = "all") -> str:
     where = {"err": " WHERE etype IN ('video.delivery_failed','video.dead_letter','telegram.error','video.filtered') ",
              "ok": " WHERE etype IN ('video.delivered') ",
@@ -1104,7 +1121,7 @@ def tgv_history_text(mode: str = "all") -> str:
         "import sqlite3,json;c=sqlite3.connect('/home/adelf/projects/tg-video/data/data.db');"
         "c.row_factory=sqlite3.Row;"
         "print(json.dumps([dict(r) for r in c.execute("
-        f"'SELECT ts,etype,source_title,status,error,detail FROM events{where}"
+        f"'SELECT ts,etype,source_title,source_id,status,error,detail FROM events{where}"
         "ORDER BY id DESC LIMIT 10')]))"
     )
     data = host_run_json(f"python3 -c {shlex.quote(py)}", timeout=20)
@@ -1117,12 +1134,17 @@ def tgv_history_text(mode: str = "all") -> str:
     for r in rows:
         import time as _t
         ts = _t.strftime('%d.%m %H:%M', _t.localtime(r.get('ts', 0)))
-        name = (r.get('source_title') or r.get('source_id') or '?')
-        text += "\u2022 `" + ts + "` `" + str(r.get('etype')) + "` \u2014 " + str(name) + "\n"
+        name = r.get('source_title') or r.get('source_id') or 'без названия'
+        etype = str(r.get('etype') or '')
+        icon, label = TGV_EVENT_LABELS.get(
+            etype, ('•', etype.replace('.', ' · ') or 'событие')
+        )
+        text += '• `' + ts + '` ' + icon + ' ' + label + ' — ' + str(name) + '\n'
         if r.get('error'):
-            text += "  \u274c " + str(r.get('error'))[:80] + "\n"
-        if r.get('detail'):
-            text += "  \u2139 " + str(r.get('detail'))[:60] + "\n"
+            text += '  ❌ ' + str(r.get('error'))[:80] + '\n'
+        detail = TGV_DETAIL_LABELS.get(str(r.get('detail') or ''), r.get('detail'))
+        if detail:
+            text += '  ℹ ' + str(detail)[:60] + '\n'
     return text
 
 
