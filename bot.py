@@ -1168,15 +1168,15 @@ def tgv_monitor_text() -> str:
     )
     data = host_run_json(f"python3 -c {shlex.quote(py)}", timeout=20)
     q = (data or {}).get("queue") or {}
-    e24 = (data or {}).get("events24") or "?"
+    e24 = (data or {}).get("events24") or "\u043d/\u0434"
     def n(k):
         return q.get(k, 0)
     return (
         "\U0001F4CA *TG-VIDEO \u2014 \u043c\u043e\u043d\u0438\u0442\u043e\u0440\u0438\u043d\u0433*\n\n"
         f"\u23f3 \u0412 \u043e\u0447\u0435\u0440\u0435\u0434\u0438: `{n('pending')}`\n"
         f"\u2699 \u041e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0430: `{n('processing')}` \u00b7 \u043e\u0442\u043f\u0440\u0430\u0432\u043a\u0430 `{n('sending')}`\n"
-        f"\u2753 \u0414\u043e\u0441\u0442\u0430\u0432\u043a\u0430?: `{n('delivery_unknown')}`\n"
-        f"\u2705 \u0423\u0441\u043f\u0435\u0448\u043d\u043e: `{n('succeeded')}` \u00b7 dead-letter `{n('dead_letter')}`\n"
+        f"\u2753 \u041d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e: `{n('delivery_unknown')}`\n"
+        f"\u2705 \u0423\u0441\u043f\u0435\u0448\u043d\u043e: `{n('succeeded')}` \u00b7 \u043d\u0435 \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d\u043e `{n('dead_letter')}`\n"
         f"\U0001F4C5 \u0421\u043e\u0431\u044b\u0442\u0438\u0439 \u0437\u0430 24\u0447: `{e24}`\n\n"
         "\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u043e \u043f\u043e \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0430\u043c \u2014 \u0432 Mini App."
     )
