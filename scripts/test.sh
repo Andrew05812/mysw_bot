@@ -4,7 +4,7 @@
 # Usage: ./scripts/test.sh [mybot:image-tag]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-IMAGE="${1:-mybot:81bcd03}"
+IMAGE="${1:-mybot:latest}"
 docker run --rm --entrypoint bash \
   -v "$PWD:/workspace" \
   "$IMAGE" \

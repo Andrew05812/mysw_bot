@@ -407,7 +407,7 @@ def run_plugin(name: str) -> tuple[bool, str]:
 def diagnostics_text() -> str:
     checks = []
     ssh_ok = not (host_run("echo ok", timeout=8).startswith("❌"))
-    checks.append(("SSH host_run", ssh_ok))
+    checks.append(("SSH host run", ssh_ok))
     sudo_ok = host_run("sudo -n true", timeout=8)
     checks.append(("sudo -n", not (sudo_ok.startswith("❌") or sudo_ok.startswith("⏰") or "password" in sudo_ok.lower())))
     disk = host_collect_system_metrics(interval_seconds=0.2)
@@ -708,6 +708,43 @@ def truncate_long_output(text: str, max_total: int = 3500, head_chars: int = 150
     if tail_chars < 0:
         tail_chars = 0
     return text[:head_chars] + "\n...\n" + (text[-tail_chars:] if tail_chars else "")
+
+def fit_message(text: str, limit: int = 4096) -> str:
+    """Guarantee a Telegram-safe length and keep code fences balanced."""
+    if not isinstance(text, str):
+        return text
+    fence = chr(96) * 3
+    if len(text) > limit:
+        text = truncate_long_output(text, max_total=limit - 80,
+                                    head_chars=(limit - 80) // 2,
+                                    tail_chars=(limit - 80) // 2)
+    if text.count(fence) % 2:
+        text = text + "\n" + fence
+    return text
+
+def is_transient_telegram_error(error) -> bool:
+    """True when the failure is a temporary transport/gateway problem.
+
+    Telegram API sometimes answers through a Cloudflare 502 HTML page instead
+    of JSON; PTB surfaces that as TelegramError('Invalid server response').
+    Such failures are retried a few times instead of dropping the screen.
+    """
+    text = str(error).lower()
+    markers = (
+        "invalid server response",
+        "bad gateway",
+        "gateway",
+        "timed out",
+        "timeout",
+        "connection",
+        "temporarily unavailable",
+        "502",
+        "503",
+        "504",
+        "too many requests",
+    )
+    return any(marker in text for marker in markers)
+
 
 def redact_sensitive_data(value):
     """Remove secrets from a string before it is persisted or shown.
@@ -1864,7 +1901,7 @@ def host_ls_dir(path: str, limit: int = FS_PAGE_LIMIT) -> dict:
         "    sys.exit(0)\n"
         "for e in entries:\n"
         "    try:\n"
-        "        is_dir=e.is_dir(follow_symlinks=False)\n"
+        "        is_dir=e.is_dir()  # follow symlinks: links to dirs must open as dirs\n"
         "    except Exception:\n"
         "        is_dir=False\n"
         "    try:\n"
@@ -2803,7 +2840,7 @@ def apps_kb():
 
 async def apps_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_is_admin(update.effective_user.id):
-        await update.message.reply_text("\u2b1b \u0414\u043e\u0441\u0442\u0443\u043f \u0437\u0430\u043f\u0440\u0435\u0449\u0435\u043d.")
+        await update.message.reply_text("\u26d4 \u0414\u043e\u0441\u0442\u0443\u043f \u0437\u0430\u043f\u0440\u0435\u0449\u0435\u043d.")
         return
     await update.message.reply_text(
         "\U0001F4F1 *\u041f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u044f*\n\n"
@@ -2826,7 +2863,7 @@ async def show_tgvideo_menu(context, chat_id):
 
 async def tgvideo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_is_admin(update.effective_user.id):
-        await update.message.reply_text("\u2b1b \u0414\u043e\u0441\u0442\u0443\u043f \u0437\u0430\u043f\u0440\u0435\u0449\u0435\u043d.")
+        await update.message.reply_text("\u26d4 \u0414\u043e\u0441\u0442\u0443\u043f \u0437\u0430\u043f\u0440\u0435\u0449\u0435\u043d.")
         return
     await show_tgvideo_menu(context, update.effective_chat.id)
 
@@ -2840,17 +2877,32 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     async def edit(text, kb=None):
+        text = fit_message(text)
         markup = InlineKeyboardMarkup(kb) if kb else None
-        try:
-            await q.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
-        except Exception as e:
-            if "Message is not modified" in str(e):
-                return
+        for attempt in range(3):
             try:
-                await q.message.delete()
-            except Exception:
-                pass
-            await q.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+                await q.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+                return
+            except Exception as exc:
+                reason = str(exc)
+                if "Message is not modified" in reason:
+                    return
+                if "parse entities" in reason.lower():
+                    # Dynamic content broke the Markdown entity: show it as text
+                    # instead of dropping the whole screen.
+                    try:
+                        await q.edit_message_text(text, reply_markup=markup)
+                        return
+                    except Exception as plain_exc:
+                        exc = plain_exc
+                if not is_transient_telegram_error(exc):
+                    break
+            await asyncio.sleep(0.5 * (attempt + 1))
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await q.message.reply_text(text, reply_markup=markup)
 
     # Файловый менеджер
     if d.startswith("fs_"):
@@ -3153,7 +3205,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # end fs handler
 
     # Раздел "Приложения" (callback data начинается с app_)
-    if d.startswith("app_"):
+    if d == "apps_back" or d.startswith("app_"):
         try:
             if d == "apps_back":
                 await edit("\U0001F4F1 *\u041f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u044f*\n\n\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435:", apps_kb())
@@ -3698,6 +3750,17 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif d == "reboot_no":
         await edit("❌ Перезагрузка отменена.")
 
+    else:
+        # Stale or unknown button: never leave the user with a silent tap.
+        await edit(
+            "⚠️ *Кнопка устарела.*\n\n"
+            "Это меню создано до перезапуска бота. Откройте раздел заново.",
+            [
+                [InlineKeyboardButton("📱 Приложения", callback_data="apps_back")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="fs_menu")],
+            ],
+        )
+
 # ═══════════════════════════════════════════════════════════════
 # МОНИТОРИНГ
 # ═══════════════════════════════════════════════════════════════
@@ -3844,6 +3907,128 @@ def start_docker_event_monitor():
     except Exception as exc:
         print(f"Docker initial state error: {exc}", flush=True)
 
+
+def polling_is_healthy(application) -> bool:
+    updater = getattr(application, "updater", None)
+    if updater is None or not getattr(updater, "running", False):
+        return False
+    task = getattr(updater, "_Updater__polling_task", None)
+    if task is not None and task.done():
+        return False
+    return True
+
+
+def write_heartbeat(healthy: bool, note: str = "") -> None:
+    try:
+        ensure_data_dir()
+        payload = {
+            "ts": int(time.time()),
+            "iso": datetime.now().isoformat(timespec="seconds"),
+            "polling": bool(healthy),
+            "note": str(note)[:200],
+            "restarts": _poll_state["restarts"],
+            "failures": _poll_state["failures"],
+        }
+        tmp_path = HEARTBEAT_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp_path, HEARTBEAT_FILE)
+    except Exception:
+        pass
+
+
+async def restart_polling(app) -> bool:
+    updater = getattr(app, "updater", None)
+    if updater is None:
+        return False
+    print("watchdog: restarting telegram polling", flush=True)
+    try:
+        if getattr(updater, "running", False):
+            await updater.stop()
+    except Exception as exc:
+        print("watchdog: stop failed: %s" % exc, flush=True)
+    delay = 1.0
+    for attempt in range(1, 6):
+        await asyncio.sleep(delay)
+        delay = min(30.0, delay * 2)
+        try:
+            await updater.start_polling(
+                poll_interval=1.0,
+                timeout=10,
+                bootstrap_retries=-1,
+                drop_pending_updates=False,
+            )
+        except Exception as exc:
+            _poll_state["last_error"] = str(exc)[:200]
+            print("watchdog: attempt %d failed: %s" % (attempt, exc), flush=True)
+            continue
+        _poll_state["restarts"] += 1
+        _poll_state["failures"] = 0
+        print("watchdog: polling restored", flush=True)
+        write_heartbeat(True, "restarted")
+        return True
+    print("watchdog: polling NOT restored, exiting for container restart", flush=True)
+    write_heartbeat(False, "restart failed")
+    os._exit(1)
+async def poll_watchdog(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _poll_restart_lock
+    app = context.application
+    if _poll_restart_lock is None:
+        _poll_restart_lock = asyncio.Lock()
+    if _poll_restart_lock.locked():
+        return
+    healthy = polling_is_healthy(app)
+    if healthy:
+        try:
+            await app.bot.get_me()
+            _poll_state["failures"] = 0
+            _poll_state["last_ok"] = int(time.time())
+        except Exception as exc:
+            _poll_state["failures"] += 1
+            _poll_state["last_error"] = str(exc)[:200]
+            if _poll_state["failures"] >= 2:
+                healthy = False
+    else:
+        _poll_state["failures"] += 1
+    write_heartbeat(healthy, _poll_state.get("last_error") or "")
+    if healthy:
+        return
+    async with _poll_restart_lock:
+        if polling_is_healthy(app):
+            return
+        await restart_polling(app)
+
+
+def start_heartbeat_watchdog() -> None:
+    def loop() -> None:
+        stale = 0
+        while True:
+            time.sleep(30)
+            try:
+                age = time.time() - os.path.getmtime(HEARTBEAT_FILE)
+            except OSError:
+                continue
+            if age <= POLL_HEARTBEAT_MAX_AGE:
+                stale = 0
+                continue
+            stale += 1
+            print("watchdog: heartbeat stale for %ds" % int(age), flush=True)
+            if stale >= 2:
+                print("watchdog: event loop is stuck, exiting", flush=True)
+                os._exit(2)
+
+    thread = threading.Thread(target=loop, name="poll-heartbeat", daemon=True)
+    thread.start()
+
+
+# --- Сторож опроса Telegram -------------------------------------------------
+
+HEARTBEAT_FILE = os.path.join(DATA_DIR, "polling_heartbeat.json")
+POLL_WATCH_INTERVAL = 60
+POLL_HEARTBEAT_STALE = 300
+POLL_HEARTBEAT_MAX_AGE = 600
+_poll_state = {"failures": 0, "restarts": 0, "last_ok": None, "last_error": None}
+_poll_restart_lock = None
 
 async def monitor(context: ContextTypes.DEFAULT_TYPE):
     global alert_cooldown
@@ -4043,8 +4228,13 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.job_queue.run_repeating(monitor, interval=120, first=30)
+    app.job_queue.run_repeating(
+        poll_watchdog, interval=POLL_WATCH_INTERVAL, first=45
+    )
+    write_heartbeat(True, "startup")
+    start_heartbeat_watchdog()
 
     print("🚀 Бот запущен!")
     # Telegram может иногда недоступен при старте (NAT/сеть/таймаут).
     # При bootstrap_retries>0 PTB повторит и не завершит процесс.
-    app.run_polling(drop_pending_updates=True, bootstrap_retries=25)
+    app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)

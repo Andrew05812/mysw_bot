@@ -68,3 +68,38 @@ CI runs all of the above on push/PR (`.github/workflows/ci.yml`).
   log and user-visible text; `classify_dangerous()` routes destructive commands
   through password confirmation.
 - See `docs/SECURITY.md`.
+
+## Reliability (3.3.9)
+
+- Polling watchdog (`poll_watchdog`) runs every 60 s. The updater is treated as
+  dead when `Updater.running` is false or the internal polling task is done, and
+  it is verified with `getMe` through the Worker. After a dead poll the watchdog
+  stops the updater and restarts long polling (5 attempts, backoff 1..30 s). If
+  no attempt succeeds the process exits with code 1 and Docker restarts the
+  container instead of leaving a deaf bot alive.
+- `DATA_DIR/polling_heartbeat.json` is refreshed by the watchdog. A daemon thread
+  checks its mtime and exits with code 2 when the file is older than 600 s, which
+  covers a stuck event loop. The file holds `polling`, `failures`, `restarts`,
+  `note` and `iso`.
+- Boot uses `bootstrap_retries=-1`: a Telegram/Worker outage at startup no longer
+  kills the process. Pending updates are dropped on the first start only and kept
+  on watchdog restarts.
+- `fit_message()` caps a screen at 4096 characters and closes an opened code
+  fence. If Telegram still rejects the Markdown entity, the callback `edit()`
+  reposts the same text with no `parse_mode`, so the screen is never lost.
+- A callback unknown to the current build (old message after redeploy) now answers
+  with a hint and menu buttons instead of doing nothing.
+- File manager: symlinks to directories are listed as folders and open as folders.
+- Diagnostics: check labels contain no underscore, so Markdown cannot swallow the
+  report.
+
+## Test suite layout
+
+- `tests/unit`, `tests/security`, `tests/handlers` are fast and offline.
+- `tests/ua` user-scenario acceptance tests press every reply-keyboard button, every
+  command and every reachable inline button through the real handlers. The suite
+  fails on silence, duplicate or oversized button payloads, messages over 4096
+  characters, broken Markdown entities left by dynamic content, and on leaked host
+  diagnostics shown to the user.
+- `tests/ua/crawl.py` repeats the crawl against the live host and writes
+  `/out/report.json`; run it only in a throwaway container.
