@@ -1213,10 +1213,15 @@ def tgv_status_text() -> str:
     api = host_run(f"curl -fsS -o /dev/null -w '%{{http_code}}' --max-time 6 {TGV_HEALTH_URL}", timeout=12).strip()
     if not api or not api.isdigit():
         api = "недоступен"
-    mt = host_run(
-        f"timeout 2 bash -c 'cat < /dev/null > /dev/tcp/{TGV_MT_PROXY}' && echo open || echo closed",
-        timeout=10,
-    ).strip()
+    mt_host, _, mt_port = TGV_MT_PROXY.partition(":")
+    if mt_host and mt_port.isdigit():
+        mt = host_run(
+            f"timeout 2 bash -c 'cat < /dev/null > /dev/tcp/{mt_host}/{mt_port}'"
+            " && echo open || echo closed",
+            timeout=10,
+        ).strip()
+    else:
+        mt = "unknown"
     mt_text = {"open": "открыт", "closed": "закрыт"}.get(mt, "неизвестно")
     if not started:
         started = "н/д"

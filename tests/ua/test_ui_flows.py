@@ -162,6 +162,30 @@ def test_broken_markdown_screen_is_reposted_as_plain_text(ui):
     assert "parse_mode" not in replies[-1]
 
 
+def test_tgvideo_status_checks_mtproxy_with_host_port(ui, monkeypatch):
+    seen = []
+
+    def fake(command, timeout=10):
+        seen.append(command)
+        if "/dev/tcp/" in command:
+            return "open"
+        if "is-active" in command:
+            return "active"
+        if "http_code" in command:
+            return "200"
+        return ""
+
+    monkeypatch.setattr(bot, "host_run", fake)
+    monkeypatch.setattr(bot, "tgv_query_health",
+                        lambda: {"api": "ok", "telegram": True})
+    text = bot.tgv_status_text()
+    probe = [cmd for cmd in seen if "/dev/tcp/" in cmd]
+    assert probe, seen
+    assert "/dev/tcp/127.0.0.1/1443" in probe[0]
+    assert "открыт" in text
+    assert "закрыт" not in text
+
+
 def test_non_admin_sees_only_denial(ui, monkeypatch):
     monkeypatch.setattr(bot, "AUTHENTICATED_USERS", set())
     monkeypatch.setattr(bot, "_AUTH_SESSIONS", {})
