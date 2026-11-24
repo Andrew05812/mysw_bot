@@ -1220,9 +1220,9 @@ def tgv_queue_text() -> str:
         f"\u2699\ufe0f \u0412 \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0435: `{nn('processing')}`\n"
         f"\U0001F4E4 \u041e\u0442\u043f\u0440\u0430\u0432\u043a\u0430: `{nn('sending')}`\n"
         f"\U0001F501 \u041f\u043e\u0432\u0442\u043e\u0440\u044b: `{nn('retry_wait')}`\n"
-        f"\u2753 \u041d\u0435\u043e\u043f\u0440\u0435\u0434.: `{nn('delivery_unknown')}`\n"
+        f"\u2753 \u041d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e: `{nn('delivery_unknown')}`\n"
         f"\u2705 \u0423\u0441\u043f\u0435\u0448\u043d\u043e: `{nn('succeeded')}`\n"
-        f"\u274c Dead-letter: `{nn('dead_letter')}`\n\n"
+        f"\u274c Не доставлено: `{nn('dead_letter')}`\n\n"
         "\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u043e \u2014 \u0432 Mini App."
     )
 
