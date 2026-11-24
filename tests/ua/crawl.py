@@ -49,6 +49,12 @@ def inline_datas(markup):
     return found
 
 
+FILE_APIS = {
+    "reply_document", "reply_voice", "reply_video", "reply_audio",
+    "reply_sticker", "reply_location",
+}
+
+
 def check_calls(calls):
     problems = []
     for call in calls:
@@ -58,7 +64,9 @@ def check_calls(calls):
         txt = call.get("text")
         limit = CAPTION_LIMIT if "photo" in api or "document" in api else TEXT_LIMIT
         if not isinstance(txt, str) or not txt.strip():
-            problems.append({"kind": "empty", "api": api})
+            # Media calls legitimately carry no text.
+            if api not in FILE_APIS:
+                problems.append({"kind": "empty", "api": api})
             continue
         if len(txt) > limit:
             problems.append({"kind": "too_long", "api": api, "len": len(txt), "limit": limit})
@@ -149,7 +157,7 @@ def main():
     queue = text_actions() + command_actions()
     results = []
     seen = set()
-    while queue and len(results) < 400:
+    while queue and len(results) < 1200:
         action = queue.pop(0)
         key = (action["kind"], action["value"])
         if key in seen:

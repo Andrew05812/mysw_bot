@@ -182,7 +182,7 @@ def get_cpu_temp():
             return f"{int(result.stdout.strip()) / 1000:.0f}°C"
     except Exception:
         pass
-    return "N/A"
+    return "н/д"
 
 def ensure_data_dir():
     try:
@@ -808,10 +808,10 @@ def get_system_stats():
     cpu_count = cpu_count_phys if cpu_count_phys is not None else cpu_count_log
 
     cpu_freq_mhz = metrics.get("cpu_freq_mhz")
-    freq_str = f"{cpu_freq_mhz:.0f} МГц" if cpu_freq_mhz is not None else "N/A"
+    freq_str = f"{cpu_freq_mhz:.0f} МГц" if cpu_freq_mhz is not None else "н/д"
 
     temp_c = metrics.get("temp_c")
-    temp = f"{temp_c:.0f}°C" if temp_c is not None else "N/A"
+    temp = f"{temp_c:.0f}°C" if temp_c is not None else "н/д"
 
     uptime_sec = float(metrics.get("uptime_sec", 0.0))
     days = int(uptime_sec // 86400)
@@ -842,7 +842,7 @@ def get_system_stats():
     phys_total_gb = int(metrics.get("phys_total_gb", 0) or 0)
     phys_device = metrics.get("phys_device") or "unknown"
     disk_devices = metrics.get("disk_devices") or []
-    disks_line = ", ".join([f"{d.get('name')}:{d.get('size_gb')}ГБ" for d in disk_devices[:4]]) or "N/A"
+    disks_line = ", ".join([f"{d.get('name')}:{d.get('size_gb')}ГБ" for d in disk_devices[:4]]) or "н/д"
 
     rx_speed_str = format_rate_bps(metrics.get("rx_speed_bps", 0.0))
     tx_speed_str = format_rate_bps(metrics.get("tx_speed_bps", 0.0))
@@ -903,10 +903,11 @@ def get_processes():
     by_mem = parse_ps(raw_mem)
 
     load_parts = load.split()
-    load_str = f"{load_parts[0]} {load_parts[1]} {load_parts[2]}" if len(load_parts) >= 3 else "N/A"
-    procs_str = str(int(total_procs) - 1) if total_procs.isdigit() else "?"
+    load_str = f"{load_parts[0]} {load_parts[1]} {load_parts[2]}" if len(load_parts) >= 3 else "н/д"
+    procs_str = str(int(total_procs) - 1) if total_procs.isdigit() else ""
 
-    text = f"📋 *Топ процессов* (всего: {procs_str})\n"
+    total_note = f" (всего: {procs_str})" if procs_str else ""
+    text = f"📋 *Топ процессов*{total_note}" + "\n"
     text += f"📊 Нагрузка (1/5/15 мин): `{load_str}`\n\n"
     text += "⚡️ *По CPU:*\n```\n"
     text += f"{'PID':>6} {'USER':<8} {'CPU%':>5} {'MEM%':>5} {'RSS':>6} КОМАНДА\n"
@@ -1206,16 +1207,19 @@ def tgv_queue_text() -> str:
 
 
 def tgv_status_text() -> str:
-    active = (host_run(f"systemctl is-active {TGV_SERVICE}", timeout=15) or "unknown").strip()
-    started = (host_run(f"systemctl show {TGV_SERVICE} -p ActiveEnterTimestamp --value", timeout=15) or "unknown").strip()
+    active = (host_run(f"systemctl is-active {TGV_SERVICE}", timeout=15) or "неизвестно").strip()
+    started = (host_run(f"systemctl show {TGV_SERVICE} -p ActiveEnterTimestamp --value", timeout=15) or "неизвестно").strip()
     health = tgv_query_health()
     api = host_run(f"curl -fsS -o /dev/null -w '%{{http_code}}' --max-time 6 {TGV_HEALTH_URL}", timeout=12).strip()
     if not api or not api.isdigit():
-        api = "unreachable"
+        api = "недоступен"
     mt = host_run(
         f"timeout 2 bash -c 'cat < /dev/null > /dev/tcp/{TGV_MT_PROXY}' && echo open || echo closed",
         timeout=10,
     ).strip()
+    mt_text = {"open": "открыт", "closed": "закрыт"}.get(mt, "неизвестно")
+    if not started:
+        started = "н/д"
 
     svc_emoji = "\U0001F7E2" if active == "active" else "\U0001F534"
     hapi = health.get("api")
@@ -1224,15 +1228,18 @@ def tgv_status_text() -> str:
     h_emoji = "\U0001F7E2" if tg is True else ("\U0001F534" if tg is False else "\U0001F7E0")
     api2_emoji = "\U0001F7E2" if api.isdigit() and api.startswith("2") else "\U0001F534"
     m_emoji = "\U0001F7E2" if mt == "open" else "\U0001F534"
+    api_state = {"ok": "\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d",
+                 "down": "\u043d\u0435 \u043e\u0442\u0432\u0435\u0447\u0430\u0435\u0442"}.get(hapi, "\u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445")
+    tg_state = "\u0434\u0430" if tg is True else ("\u043d\u0435\u0442" if tg is False else "\u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445")
 
     return (
         "\U0001F3AC *TG-VIDEO \u2014 \u0441\u0442\u0430\u0442\u0443\u0441*\n\n"
         f"{svc_emoji} \u0421\u043b\u0443\u0436\u0431\u0430: `{active}`\n"
         f"\U0001F552 \u0421\u0442\u0430\u0440\u0442: `{started}`\n"
-        f"{a_emoji} API: `{hapi}`\n"
-        f"{h_emoji} Telegram connected: `{tg}`\n"
+        f"{a_emoji} API: `{api_state}`\n"
+        f"{h_emoji} Telegram: `{tg_state}`\n"
         f"{api2_emoji} \u041b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0439 API: `{api}`\n"
-        f"{m_emoji} MTProxy `{TGV_MT_PROXY}`: `{mt}`\n"
+        f"{m_emoji} MTProxy `{TGV_MT_PROXY}`: `{mt_text}`\n"
         f"\U0001F517 Mini App: [\u043e\u0442\u043a\u0440\u044b\u0442\u044c]({TGV_PUBLIC_URL})"
     )
 
@@ -1245,8 +1252,8 @@ def tgv_sources_text() -> str:
         timeout=20,
     )
     parts = (out or "").split()
-    srcs = parts[0] if len(parts) > 0 else "?"
-    sent = parts[1] if len(parts) > 1 else "?"
+    srcs = parts[0] if len(parts) > 0 and parts[0].isdigit() else "н/д"
+    sent = parts[1] if len(parts) > 1 and parts[1].isdigit() else "н/д"
     return (
         "📂 *TG-VIDEO — источники*\n\n"
         f"🔢 Источников: `{srcs}`\n"
@@ -2114,9 +2121,9 @@ async def sysinfo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка sysinfo: `{info.get('error') or info}`")
         return
 
-    kernel = info.get("kernel") or "N/A"
-    hostname = info.get("hostname") or "N/A"
-    boot = info.get("boot") or "N/A"
+    kernel = info.get("kernel") or "н/д"
+    hostname = info.get("hostname") or "н/д"
+    boot = info.get("boot") or "н/д"
     load1 = float(info.get("load1") or 0.0)
     load5 = float(info.get("load5") or 0.0)
     load15 = float(info.get("load15") or 0.0)
@@ -2133,7 +2140,7 @@ async def sysinfo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wr_avail = int(storage.get("writable_avail_gb", 0)) if storage.get("ok") else 0
     wr_pct = float(storage.get("writable_percent", 0.0)) if storage.get("ok") else 0.0
     disk_devices = storage.get("disk_devices") if storage.get("ok") else []
-    disks_line = ", ".join([f"{d.get('name')}:{d.get('size_gb')}ГБ" for d in (disk_devices or [])[:8]]) or "N/A"
+    disks_line = ", ".join([f"{d.get('name')}:{d.get('size_gb')}ГБ" for d in (disk_devices or [])[:8]]) or "н/д"
     text = (
         f"ℹ️ *Информация о системе*\n\n"
         f"🏠 Хост: `{hostname}`\n"
@@ -3528,9 +3535,9 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not info.get("ok"):
             await edit(f"❌ Ошибка sysinfo: `{info.get('error') or info}`")
             return
-        kernel = info.get("kernel") or "N/A"
-        hostname = info.get("hostname") or "N/A"
-        boot = info.get("boot") or "N/A"
+        kernel = info.get("kernel") or "н/д"
+        hostname = info.get("hostname") or "н/д"
+        boot = info.get("boot") or "н/д"
         load1 = float(info.get("load1") or 0.0)
         load5 = float(info.get("load5") or 0.0)
         load15 = float(info.get("load15") or 0.0)
@@ -3547,7 +3554,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wr_avail = int(storage.get("writable_avail_gb", 0)) if storage.get("ok") else 0
         wr_pct = float(storage.get("writable_percent", 0.0)) if storage.get("ok") else 0.0
         disk_devices = storage.get("disk_devices") if storage.get("ok") else []
-        disks_line = ", ".join([f"{d.get('name')}:{d.get('size_gb')}ГБ" for d in (disk_devices or [])[:8]]) or "N/A"
+        disks_line = ", ".join([f"{d.get('name')}:{d.get('size_gb')}ГБ" for d in (disk_devices or [])[:8]]) or "н/д"
 
         text = (
             f"ℹ️ *Информация о системе*\n\n"

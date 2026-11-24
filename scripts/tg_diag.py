@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diagnose Telegram Bot API reachability: worker vs direct. No secrets printed."""
+"""Read-only Telegram/Worker connectivity probe. Prints no secrets."""
 import json
 import os
 import urllib.request
@@ -10,34 +10,35 @@ WORKER = "https://tg-bot-api-proxy.andrey05812andrey05812.workers.dev"
 UA = "mysw-bot-diag/1.0"
 
 
-TARGETS = [
-    ("worker", WORKER + "/bot" + TOKEN + "/getMe", {"X-Worker-Api-Key": KEY}),
-    ("direct", "https://api.telegram.org/bot" + TOKEN + "/getMe", {}),
-    ("worker", WORKER + "/bot" + TOKEN + "/getWebhookInfo", {"X-Worker-Api-Key": KEY}),
-    ("direct", "https://api.telegram.org/bot" + TOKEN + "/getWebhookInfo", {}),
-]
-
-for name, url, extra in TARGETS:
+def call(base, method, headers=None):
+    url = base + "/bot" + TOKEN + "/" + method
     req = urllib.request.Request(url)
     req.add_header("User-Agent", UA)
-    for key, value in extra.items():
-        req.add_header(key, value)
+    for name, value in (headers or {}).items():
+        req.add_header(name, value)
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        return resp.status, json.loads(resp.read(4000).decode("utf-8", "replace"))
+
+
+def report(label, method, status, data):
+    result = data.get("result")
+    summary = {"ok": data.get("ok"), "status": status}
+    if method == "getMe" and isinstance(result, dict):
+        summary["is_bot"] = result.get("is_bot")
+        summary["can_join_groups"] = result.get("can_join_groups")
+    if method == "getWebhookInfo" and isinstance(result, dict):
+        summary["pending"] = result.get("pending_update_count")
+        summary["webhook"] = bool(result.get("url"))
+        summary["last_error"] = result.get("last_error_message")
+    if method == "getMyCommands":
+        summary["commands"] = len(result or [])
+        summary["names"] = [item.get("command") for item in (result or [])]
+    print(label, method, json.dumps(summary, ensure_ascii=False))
+
+
+for method in ("getMe", "getWebhookInfo", "getMyCommands"):
     try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            body = resp.read(600).decode("utf-8", "replace")
-            data = json.loads(body)
-            method = url.rsplit("/", 1)[-1]
-            summary = {"ok": data.get("ok"), "status": resp.status}
-            result = data.get("result")
-            if isinstance(result, dict):
-                summary.update(
-                    {
-                        "pending": result.get("pending_update_count"),
-                        "webhook": bool(result.get("url")),
-                        "last_error": result.get("last_error_message"),
-                        "username_is_bot": result.get("is_bot"),
-                    }
-                )
-            print(name, method, json.dumps(summary, ensure_ascii=False))
+        status, data = call(WORKER, method, {"X-Worker-Api-Key": KEY})
+        report("worker", method, status, data)
     except Exception as exc:
-        print(name, "ERR", type(exc).__name__, str(exc)[:140])
+        print("worker", method, "ERR", type(exc).__name__, str(exc)[:120])

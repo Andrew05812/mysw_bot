@@ -68,7 +68,7 @@ def test_no_dead_inline_buttons(ui):
             if data not in seen:
                 queue.append(data)
     dead = []
-    while queue and len(seen) < 200:
+    while queue and len(seen) < 600:
         data = queue.pop(0)
         if data in seen:
             continue
